@@ -159,14 +159,20 @@ global_asm!(
     rust_init = sym rust_init,
 );
 
-/// Zero the BSS section, call C++ static constructors, then call kernel_main.
+/// Zero the BSS section and call kernel_main.
 ///
 /// # Safety
 /// Called from assembly once the stack pointer is valid. Must not be
 /// inlined or the compiler may emit a prologue before SP is ready.
+///
+/// NOTE: We do NOT call C++ static constructors (.init_array) here.
+/// Circle's objects (CInterruptSystem, CTimer, CXHCIDevice) are
+/// declared as local variables inside circle_usb_init() in the shim,
+/// NOT as file-scope statics. This avoids constructors running at
+/// boot time before UART/framebuffer are ready, which would crash.
 #[no_mangle]
 unsafe extern "C" fn rust_init() -> ! {
-    // ── 1. Zero the BSS section (static mut variables, zero-init globals) ──
+    // Zero the BSS section (static mut variables, zero-init globals).
     extern "C" {
         static __bss_start: u8;
         static __bss_end: u8;
@@ -176,29 +182,5 @@ unsafe extern "C" fn rust_init() -> ! {
     let bss_len   = bss_end as usize - bss_start as usize;
     core::ptr::write_bytes(bss_start, 0, bss_len);
 
-    // ── 2. Call C++ static constructors (.init_array) ──────────────────────
-    // Circle's CInterruptSystem, CTimer, CDeviceNameService, and CXHCIDevice
-    // are declared as file-scope statics in circle_usb_shim.cpp. Their
-    // constructors are registered in the .init_array section by the C++
-    // compiler. Without calling these, all Circle objects are zero-
-    // initialized: vtable pointers are NULL, member variables are wrong,
-    // and the first method call crashes or hangs.
-    //
-    // The linker script defines __init_start and __init_end around
-    // .init_array. Each entry is a function pointer (8 bytes on AArch64).
-    extern "C" {
-        static __init_start: u8;
-        static __init_end: u8;
-    }
-    let init_start = &__init_start as *const u8 as *const unsafe extern "C" fn();
-    let init_end   = &__init_end   as *const u8 as *const unsafe extern "C" fn();
-    let count = (init_end as usize - init_start as usize)
-              / core::mem::size_of::<unsafe extern "C" fn()>();
-    for i in 0..count {
-        let ctor = *init_start.add(i);
-        ctor();
-    }
-
-    // ── 3. Enter kernel ────────────────────────────────────────────────────
     crate::kernel_main();
 }
