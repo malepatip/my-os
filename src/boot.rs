@@ -1,53 +1,27 @@
 // SPDX-License-Identifier: MIT
 //
-// boot.rs — AArch64 bare-metal boot code for Raspberry Pi 3/4
+// boot.rs — AArch64 bare-metal boot code for Raspberry Pi 4
 //
-// This is the very first code that runs when the kernel is loaded.
-// The RPi firmware loads the kernel at 0x80000 and starts all 4 cores.
+// Boot sequence:
+//   _start (EL3 or EL2)
+//     → EL3: set SCR_EL3, CNTFRQ_EL0=54MHz, ERET to EL2
+//     → EL2: configure HCR_EL2, CNTHCTL_EL2, SCTLR_EL1,
+//             set SP_EL1 (exception stack), set VBAR_EL1,
+//             ERET to EL1
+//     → EL1: set kernel stack, jump to rust_init()
 //
-// Boot sequence
-// ─────────────
-// 1. Park cores 1-3 immediately (only core 0 continues).
-// 2. Detect the current Exception Level (EL2 or EL3).
-//    Older Pi firmware drops directly to EL2; newer Pi 4 EEPROM
-//    firmware may stay at EL3 until the kernel handles the transition.
-// 3. If at EL3: set CNTFRQ_EL0 = 54 MHz (only writable from EL3),
-//    configure SCR_EL3, and use ERET to drop to EL2.
-//    Running at EL3 is incorrect for our kernel because:
-//      a) EL3 "secure world" memory permissions differ from EL2.
-//      b) UART and GPU mailbox MMIO at 0xFE000000 are in the
-//         non-secure physical address space, which is inaccessible
-//         when NS=0 (secure) in EL3. The kernel would fault on the
-//         very first peripheral write.
-// 4. Once at EL2: configure HCR_EL2, disable the D-cache via
-//    SCTLR_EL2 (the GPU firmware enables it before handing off;
-//    mailbox buffer writes must bypass cache so the GPU sees them),
-//    set up the stack, and jump to Rust.
+// WHY EL1?
+//   Circle's interrupt/timer/USB subsystem is designed to run at EL1.
+//   It sets VBAR_EL1 and uses EL1 system registers (ELR_EL1, SPSR_EL1,
+//   SP_EL1, etc.). Running at EL2 without a proper VBAR_EL2 means any
+//   IRQ (e.g. the physical timer IRQ that CTimer arms) jumps to address
+//   0x0 and the CPU dies silently — causing the USB HID init hang.
 //
 // CNTFRQ_EL0 note
-// ────────────────
-// The ARM generic timer frequency register (CNTFRQ_EL0) is READ-ONLY
-// at EL2 and below. It can only be written from EL3. On Pi 4 with an
-// updated bootloader, start4.elf's ARM stub sets CNTFRQ_EL0 = 54 MHz
-// before handing off to the kernel at EL2. If we boot from EL3 (old
-// firmware), we set it ourselves. If the bootloader forgot to set it,
-// Circle's CTimer assert is handled by our assertion_failed() stub
-// (which returns instead of hanging) and -DNDEBUG in the shim build.
-//
-// We use global_asm! because the Rust compiler generates a function
-// prologue (stp x29, x30, [sp, #-N]!) before any Rust code runs,
-// which would dereference SP before we have set it up.
-//
-// Hardware invariants relied upon
-// ────────────────────────────────
-// • Kernel is loaded at physical address 0x80000 (set by linker.ld
-//   and confirmed by the Pi firmware for kernel8.img + arm_64bit=1).
-// • SP grows downward from 0x80000 into the memory below the kernel.
-//   The kernel image is ~22 KB; on a Pi with ≥256 MB RAM the region
-//   0x0–0x7FFFF is freely available for the stack.
-// • No MMU is active; all physical addresses are directly accessible.
-// • Interrupts are masked (DAIF=1111) from reset and we leave them
-//   masked until the kernel sets up exception vectors.
+//   CNTFRQ_EL0 is READ-ONLY at EL2 and below. It can only be written
+//   from EL3. On Pi 4 with an updated bootloader, start4.elf's ARM stub
+//   sets CNTFRQ_EL0 = 54 MHz before handing off at EL2. If we boot from
+//   EL3 (old firmware), we set it ourselves.
 
 use core::arch::global_asm;
 
@@ -59,95 +33,103 @@ global_asm!(
     // All 4 Cortex-A72 cores enter here simultaneously. Only core 0
     // (MPIDR_EL1.Aff0 == 0) continues; the rest spin in WFE.
     "mrs x8, mpidr_el1",
-    "and x8, x8, #0x3",          // isolate core number (Aff0 field)
+    "and x8, x8, #0x3",
     "cbnz x8, .L_park",
 
     // ── Exception Level detection ────────────────────────────────────────────
-    // CurrentEL[3:2] holds the current EL. Shift right by 2 to get 1/2/3.
     "mrs x9, CurrentEL",
     "lsr x9, x9, #2",
     "cmp x9, #3",
     "b.eq .L_from_el3",
     "cmp x9, #2",
     "b.eq .L_from_el2",
-    // EL1 would be very unusual and not supported — park this core.
     "b .L_park",
 
     // ── EL3 → EL2 transition ────────────────────────────────────────────────
-    // SCR_EL3 controls which features are available to EL2/1/0.
-    // We set three bits then ERET into EL2:
-    //   NS  (bit 0)  = 1 — EL2/1/0 are non-secure. This is critical:
-    //                      peripheral MMIO at 0xFE000000 is in the
-    //                      non-secure physical address space. Without NS=1
-    //                      we would fault on the first UART register write.
-    //   HCE (bit 8)  = 1 — enable HVC instruction (harmless, tidiness).
-    //   RW  (bit 10) = 1 — EL2 execution state is AArch64 (not AArch32).
     ".L_from_el3:",
+    // SCR_EL3: NS=1, HCE=1, RW=1 (EL2 is AArch64)
     "mov x8, xzr",
     "orr x8, x8, #(1 << 0)",     // NS
     "orr x8, x8, #(1 << 8)",     // HCE
     "orr x8, x8, #(1 << 10)",    // RW
     "msr scr_el3, x8",
-
-    // SPSR_EL3: processor state to restore on ERET.
-    // M[4:0] = 0b01001 = EL2h  (use SP_EL2, AArch64).
-    // DAIF   = 0b1111  (all interrupts/errors remain masked).
-    // 0x3C9  = 0b11_1100_1001
+    // SPSR_EL3: EL2h, DAIF all masked. 0x3C9 = 0b11_1100_1001
     "mov x8, #0x3c9",
     "msr spsr_el3, x8",
-
-    // ── Set CNTFRQ_EL0 = 54 MHz (only possible at EL3) ─────────────────────
-    // CNTFRQ_EL0 is READ-ONLY at EL2 — writing it at EL2 causes a
-    // synchronous exception (instant silent death with no exception vectors).
-    // We set it here at EL3 so Circle's CTimer gets the correct frequency.
-    // 54000000 = 0x033E_D280
+    // CNTFRQ_EL0 = 54 MHz (only writable at EL3). 54000000 = 0x033E_D280
     "movz x8, #0xd280",
     "movk x8, #0x033e, lsl #16",
     "msr cntfrq_el0, x8",
     "isb",
-
-    // ELR_EL3: the address to jump to after ERET (our EL2 setup code).
     "adr x8, .L_from_el2",
     "msr elr_el3, x8",
     "eret",
 
-    // ── EL2 setup ───────────────────────────────────────────────────────────
-    // Whether we arrived here from EL3 (via ERET) or directly from
-    // the firmware, we are now at EL2 in AArch64.
-    //
-    // If we came from EL3, CNTFRQ_EL0 was set above.
-    // If the bootloader dropped us directly at EL2, its ARM stub
-    // (start4.elf) should have set CNTFRQ_EL0 = 54 MHz already.
-    // If it didn't (very old firmware), Circle's assert is handled
-    // by our assertion_failed() stub which returns instead of hanging.
+    // ── EL2 setup + drop to EL1 ─────────────────────────────────────────────
+    // We arrive here either from EL3 (via ERET above) or directly from
+    // the updated bootloader (which boots into EL2).
     ".L_from_el2:",
 
-    // HCR_EL2.RW (bit 31) = 1 — EL1 (and EL0) execution state is AArch64.
-    // Required so any future EL1 code does not revert to AArch32.
+    // HCR_EL2.RW (bit 31) = 1 — EL1 execution state is AArch64.
     "mov x8, #(1 << 31)",
     "msr hcr_el2, x8",
     "isb",
 
-    // SCTLR_EL2: disable MMU (M, bit 0) and D-cache (C, bit 2).
-    // The Pi 4 GPU firmware enables the ARM D-cache before handing off.
-    // Our mailbox buffer is allocated on the stack; with D-cache on,
-    // ARM writes stay in the L1 cache and the GPU DMA engine reads
-    // stale zeros from RAM, making every mailbox property call fail.
-    // We will re-enable I/D-cache and the MMU properly once we have
-    // set up page tables in a later milestone.
-    "mrs x8, sctlr_el2",
-    "bic x8, x8, #(1 << 2)",     // C: disable D-cache
-    "bic x8, x8, #(1 << 0)",     // M: disable MMU (may already be off)
-    "msr sctlr_el2, x8",
+    // CNTHCTL_EL2: allow EL1 to access physical timer counter and regs.
+    // EL1PCTEN (bit 0) = 1, EL1PCEN (bit 1) = 1.
+    "mrs x8, cnthctl_el2",
+    "orr x8, x8, #0x3",
+    "msr cnthctl_el2, x8",
+    // Zero virtual timer offset so EL1 virtual time == physical time.
+    "msr cntvoff_el2, xzr",
+
+    // Disable coprocessor traps to EL2.
+    "mov x8, #0x33ff",
+    "msr cptr_el2, x8",
+    "msr hstr_el2, xzr",
+
+    // Enable FP/SIMD at EL1 (CPACR_EL1 bits [21:20] = 0b11).
+    "mov x8, #(3 << 20)",
+    "msr cpacr_el1, x8",
+
+    // SCTLR_EL1: RES1 bits set, MMU off, caches off.
+    // Matches Circle's startup64.S armv8_switch_to_el1_m macro.
+    "movz x8, #0x0800",
+    "movk x8, #0x30d0, lsl #16",
+    "msr sctlr_el1, x8",
+
+    // SP_EL1 = MEM_EXCEPTION_STACK = 0x308000
+    // (exception/IRQ handlers use this stack at EL1h)
+    "movz x8, #0x8000",
+    "movk x8, #0x30, lsl #16",
+    "msr sp_el1, x8",
+
+    // VBAR_EL1 = Circle's VectorTable.
+    // Without this, any IRQ jumps to address 0 and the CPU dies.
+    // VectorTable is defined in Circle's exceptionstub64.S and exported
+    // from libcircle_nostartup.a.
+    "ldr x8, =VectorTable",
+    "msr vbar_el1, x8",
     "isb",
 
-    // ── Stack setup ─────────────────────────────────────────────────────────
-    // SP points to 0x80000 and grows downward. The kernel .text section
-    // starts at 0x80000 and grows upward; there is no overlap.
-    "mov x8, #0x80000",
+    // SPSR_EL2: EL1h (0b00101), DAIF all masked. 0x3C5 = 0b11_1100_0101
+    "mov x8, #0x3c5",
+    "msr spsr_el2, x8",
+
+    // ELR_EL2: jump to EL1 entry after ERET.
+    "adr x8, .L_el1_entry",
+    "msr elr_el2, x8",
+    "eret",
+
+    // ── EL1 entry ────────────────────────────────────────────────────────────
+    ".L_el1_entry:",
+    // Kernel stack = MEM_KERNEL_STACK = 0x2A0000 (grows downward).
+    // Circle's startup64.S uses this same value.
+    "movz x8, #0x0000",
+    "movk x8, #0x2a, lsl #16",   // x8 = 0x002A0000
     "mov sp, x8",
 
-    // ── Jump to Rust ─────────────────────────────────────────────────────────
+    // Jump to Rust init.
     "b {rust_init}",
 
     // ── Park loop ────────────────────────────────────────────────────────────
@@ -174,6 +156,5 @@ unsafe extern "C" fn rust_init() -> ! {
     let bss_end   = &__bss_end   as *const u8;
     let bss_len   = bss_end as usize - bss_start as usize;
     core::ptr::write_bytes(bss_start, 0, bss_len);
-
     crate::kernel_main();
 }
