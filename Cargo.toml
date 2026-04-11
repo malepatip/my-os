@@ -1,0 +1,19 @@
+[package]
+name = "my-ai-os"
+version = "0.1.0"
+edition = "2021"
+authors = ["AI OS Builder"]
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+
+[features]
+default = ["bsp_rpi3"]
+bsp_rpi3 = []    # Raspberry Pi 3 — QEMU development (peripheral base 0x3F000000)
+bsp_rpi4 = []    # Raspberry Pi 4 — Real hardware    (peripheral base 0xFE000000)
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"

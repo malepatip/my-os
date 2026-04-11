@@ -1,0 +1,12 @@
+arm_64bit=1
+kernel=kernel8.img
+
+# Lock core clock so PL011 UART baud rate divisors are stable.
+# Without this the VPU may throttle the core clock and UART output
+# becomes garbage or is lost entirely.
+enable_uart=1
+
+# Video output
+hdmi_force_hotplug=1
+hdmi_drive=2
+disable_overscan=1

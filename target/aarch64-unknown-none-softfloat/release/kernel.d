@@ -1,0 +1,1 @@
+/home/phani/my-os/target/aarch64-unknown-none-softfloat/release/kernel: /home/phani/my-os/src/boot.rs /home/phani/my-os/src/framebuffer.rs /home/phani/my-os/src/mailbox.rs /home/phani/my-os/src/main.rs /home/phani/my-os/src/uart.rs
