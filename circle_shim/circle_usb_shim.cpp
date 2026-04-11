@@ -175,6 +175,15 @@ int circle_mouse_ready(void) {
     return s_pMouse != nullptr ? 1 : 0;
 }
 
+/// Stub for assertion_failed — called when assert() fires in non-NDEBUG builds.
+/// With -DNDEBUG all asserts are no-ops, but some object files may still have
+/// a weak reference to this symbol. We provide a no-op stub so the link succeeds.
+extern "C" void assertion_failed(const char *, const char *, unsigned) {
+    // Do nothing — we compiled with -DNDEBUG so this should never be called.
+    // If it is called anyway, silently continue rather than hanging.
+    for (;;) {} // last-resort: infinite loop (visible as a hang, not a crash)
+}
+
 /// Circle's sysinit.cpp calls main() after running C++ constructors.
 /// We don't use Circle's sysinit boot path (our Rust boot.S handles startup),
 /// but sysinit.o is pulled in transitively and the linker requires this symbol.

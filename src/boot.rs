@@ -120,6 +120,17 @@ global_asm!(
     "mov x8, #0x80000",
     "mov sp, x8",
 
+    // ── Set CNTFRQ_EL0 = 54 MHz ─────────────────────────────────────────────
+    // The Sep 2020 Pi 4 bootloader does not set CNTFRQ_EL0 before handoff.
+    // Circle's CTimer::Initialize() reads this register and asserts it is
+    // non-zero. Writing the correct Pi 4 counter frequency (54 MHz) here
+    // ensures Circle's USB/timer stack initialises correctly.
+    // 54000000 = 0x033E_D280 — load with movz/movk (too large for single mov)
+    "movz x8, #0xd280",
+    "movk x8, #0x033e, lsl #16",
+    "msr cntfrq_el0, x8",
+    "isb",
+
     // ── Jump to Rust ─────────────────────────────────────────────────────────
     "b {rust_init}",
 
