@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Compiled kernel binaries (built from source — not tracked)
+kernel8.img
+kernel8_rpi3.img
+
+# Keep sdcard/kernel8.img tracked (pre-built for flashing)
+!sdcard/kernel8.img
+
+# OS cruft
+.DS_Store
+Thumbs.db

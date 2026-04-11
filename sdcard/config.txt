@@ -1,12 +1,28 @@
 arm_64bit=1
 kernel=kernel8.img
 
+# ── UART ─────────────────────────────────────────────────────────────────────
 # Lock core clock so PL011 UART baud rate divisors are stable.
-# Without this the VPU may throttle the core clock and UART output
-# becomes garbage or is lost entirely.
 enable_uart=1
 
-# Video output
+# ── HDMI / Framebuffer ───────────────────────────────────────────────────────
+# Force HDMI output even if no monitor is detected at boot
 hdmi_force_hotplug=1
+
+# HDMI mode 2 = full HDMI (with audio); mode 1 = DVI (no audio)
 hdmi_drive=2
+
+# Disable black border (overscan)
 disable_overscan=1
+
+# Force 1280x720 @ 60Hz (CEA mode 4) — matches our kernel framebuffer resolution
+hdmi_group=1
+hdmi_mode=4
+
+# Set framebuffer to exactly 1280x720 @ 32bpp
+framebuffer_width=1280
+framebuffer_height=720
+framebuffer_depth=32
+
+# Disable the rainbow splash screen
+disable_splash=1

@@ -12,6 +12,9 @@
 //   Raspberry Pi 4:  peripheral base = 0xFE000000  →  UART at 0xFE201000
 //
 // We select the correct base at compile time using Cargo feature flags.
+//
+// NOTE: kprint!/kprintln! output UART only. Framebuffer output is
+// intentionally removed until UART is confirmed working on real hardware.
 
 use core::fmt;
 
@@ -99,7 +102,7 @@ pub fn puts(s: &str) {
     }
 }
 
-/// Return the UART base address as a string for display purposes.
+/// Return the UART base address for display purposes.
 pub fn base_address() -> usize {
     UART_BASE
 }
@@ -112,29 +115,4 @@ impl fmt::Write for UartWriter {
         puts(s);
         Ok(())
     }
-}
-
-/// Print formatted text to UART and framebuffer (if initialised).
-#[macro_export]
-macro_rules! kprint {
-    ($($arg:tt)*) => {
-        {
-            use core::fmt::Write;
-            let _ = write!($crate::uart::UartWriter, $($arg)*);
-            let _ = write!($crate::framebuffer::FbWriter, $($arg)*);
-        }
-    };
-}
-
-/// Print formatted text to UART and framebuffer with a newline.
-#[macro_export]
-macro_rules! kprintln {
-    () => { $crate::kprint!("\n") };
-    ($($arg:tt)*) => {
-        {
-            use core::fmt::Write;
-            let _ = writeln!($crate::uart::UartWriter, $($arg)*);
-            let _ = writeln!($crate::framebuffer::FbWriter, $($arg)*);
-        }
-    };
 }
