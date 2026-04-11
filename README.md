@@ -4,6 +4,8 @@ A bare-metal AI Operating System for AArch64, written in Rust.
 
 Runs directly on **Raspberry Pi 4** hardware with no Linux, no macOS, nothing underneath.
 
+**v0.2.0** — EMMC2 SD card driver + FAT32 filesystem parser added. Shell now supports `ls`, `cat`, and `sdinfo`.
+
 ![Running on real Pi 4 hardware](20260411_150830.jpg)
 
 ## What it does
@@ -18,7 +20,7 @@ Runs directly on **Raspberry Pi 4** hardware with no Linux, no macOS, nothing un
 
 ```
 ========================================
-  my-ai-os v0.1.0
+  my-ai-os v0.2.0
   Bare-Metal AArch64 AI Operating System
   Board: Raspberry Pi 4 (BCM2711)
 ========================================
@@ -40,6 +42,8 @@ ai-os> _
 ┌─────────────────────────────────────┐
 │  Shell (main.rs)                    │  ← interactive command loop
 ├─────────────────────────────────────┤
+│  FAT32 Parser      (fat32.rs)       │  ← MBR→BPB→directory→file read
+│  EMMC2 SD Driver   (emmc.rs)        │  ← BCM2711 SD @ 0xFE340000
 │  HDMI Text Console (framebuffer.rs) │  ← bitmap font renderer
 │  UART Driver       (uart.rs)        │  ← PL011 MMIO driver
 │  GPIO Driver       (gpio.rs)        │  ← activity LED control
@@ -116,7 +120,11 @@ make rpi4       # build Pi 4 kernel8.img
 | `help` | Show available commands |
 | `info` | Show system information |
 | `echo <text>` | Echo text back |
+| `clear` | Clear the HDMI screen |
 | `blink <n>` | Blink the green activity LED n times |
+| `sdinfo` | Show SD card and FAT32 status |
+| `ls` | List files in the SD card root directory |
+| `cat <FILE.EXT>` | Print file contents (8.3 format, e.g. `README.TXT`) |
 | `halt` | Halt the CPU |
 
 ## Roadmap
@@ -126,12 +134,16 @@ make rpi4       # build Pi 4 kernel8.img
 - [x] HDMI framebuffer (GPU mailbox)
 - [x] Bitmap font text console
 - [x] Interactive shell
+- [x] EMMC2 SD card driver (BCM2711 @ 0xFE340000)
+- [x] FAT32 filesystem parser (MBR, BPB, FAT chain, directory, file read)
+- [x] Shell commands: `ls`, `cat`, `sdinfo`
+- [ ] Port `llama2.c` to `no_std` Rust (`llm.rs`)
+- [ ] `ask <prompt>` command — LLM inference at EL2
 - [ ] System timer + interrupts
 - [ ] Preemptive scheduler
 - [ ] Virtual memory (MMU + page tables)
 - [ ] Exception vector table
 - [ ] NPU driver (Intel Lunar Lake — future hardware)
-- [ ] Bare-metal inference engine
 
 ## Hardware
 
