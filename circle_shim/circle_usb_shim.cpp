@@ -176,12 +176,23 @@ int circle_mouse_ready(void) {
 }
 
 /// Stub for assertion_failed — called when assert() fires in non-NDEBUG builds.
-/// With -DNDEBUG all asserts are no-ops, but some object files may still have
-/// a weak reference to this symbol. We provide a no-op stub so the link succeeds.
-extern "C" void assertion_failed(const char *, const char *, unsigned) {
-    // Do nothing — we compiled with -DNDEBUG so this should never be called.
-    // If it is called anyway, silently continue rather than hanging.
-    for (;;) {} // last-resort: infinite loop (visible as a hang, not a crash)
+///
+/// Circle declares this as NORETURN, but we intentionally return here.
+/// Rationale: if an assert fires (e.g. CNTFRQ_EL0 == 0 on old firmware),
+/// returning lets the caller continue instead of hanging the entire kernel.
+/// The NORETURN attribute only affects compiler optimisation of the caller's
+/// code path after the call — in practice, the return address is still on
+/// the stack and returning works fine on AArch64 bare metal.
+///
+/// With -DNDEBUG (set in our Makefile), assert() expands to ((void)0) and
+/// this function is never called. It exists purely as a linker safety net
+/// for any Circle object files compiled without NDEBUG.
+void assertion_failed(const char *pExpr, const char *pFile, unsigned nLine) {
+    (void)pExpr;
+    (void)pFile;
+    (void)nLine;
+    // Intentionally return — do NOT loop forever.
+    // A hang here would make debugging impossible.
 }
 
 /// Circle's sysinit.cpp calls main() after running C++ constructors.

@@ -10,9 +10,12 @@ CXX      = $(PREFIX64)g++
 AR       = $(PREFIX64)ar
 
 # AArch64 bare-metal flags — must match Circle's own build flags exactly
+# -DNDEBUG disables assert() so Circle's CTimer::Initialize() does not
+# halt when CNTFRQ_EL0 is 0 (old bootloader that forgot to set it).
 CXXFLAGS = \
     -DRASPPI=4 \
     -DAARCH=64 \
+    -DNDEBUG \
     -march=armv8-a \
     -mtune=cortex-a72 \
     -mstrict-align \

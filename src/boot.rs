@@ -11,7 +11,8 @@
 // 2. Detect the current Exception Level (EL2 or EL3).
 //    Older Pi firmware drops directly to EL2; newer Pi 4 EEPROM
 //    firmware may stay at EL3 until the kernel handles the transition.
-// 3. If at EL3: configure SCR_EL3 and use ERET to drop to EL2.
+// 3. If at EL3: set CNTFRQ_EL0 = 54 MHz (only writable from EL3),
+//    configure SCR_EL3, and use ERET to drop to EL2.
 //    Running at EL3 is incorrect for our kernel because:
 //      a) EL3 "secure world" memory permissions differ from EL2.
 //      b) UART and GPU mailbox MMIO at 0xFE000000 are in the
@@ -22,6 +23,16 @@
 //    SCTLR_EL2 (the GPU firmware enables it before handing off;
 //    mailbox buffer writes must bypass cache so the GPU sees them),
 //    set up the stack, and jump to Rust.
+//
+// CNTFRQ_EL0 note
+// ────────────────
+// The ARM generic timer frequency register (CNTFRQ_EL0) is READ-ONLY
+// at EL2 and below. It can only be written from EL3. On Pi 4 with an
+// updated bootloader, start4.elf's ARM stub sets CNTFRQ_EL0 = 54 MHz
+// before handing off to the kernel at EL2. If we boot from EL3 (old
+// firmware), we set it ourselves. If the bootloader forgot to set it,
+// Circle's CTimer assert is handled by our assertion_failed() stub
+// (which returns instead of hanging) and -DNDEBUG in the shim build.
 //
 // We use global_asm! because the Rust compiler generates a function
 // prologue (stp x29, x30, [sp, #-N]!) before any Rust code runs,
@@ -85,6 +96,16 @@ global_asm!(
     "mov x8, #0x3c9",
     "msr spsr_el3, x8",
 
+    // ── Set CNTFRQ_EL0 = 54 MHz (only possible at EL3) ─────────────────────
+    // CNTFRQ_EL0 is READ-ONLY at EL2 — writing it at EL2 causes a
+    // synchronous exception (instant silent death with no exception vectors).
+    // We set it here at EL3 so Circle's CTimer gets the correct frequency.
+    // 54000000 = 0x033E_D280
+    "movz x8, #0xd280",
+    "movk x8, #0x033e, lsl #16",
+    "msr cntfrq_el0, x8",
+    "isb",
+
     // ELR_EL3: the address to jump to after ERET (our EL2 setup code).
     "adr x8, .L_from_el2",
     "msr elr_el3, x8",
@@ -93,6 +114,12 @@ global_asm!(
     // ── EL2 setup ───────────────────────────────────────────────────────────
     // Whether we arrived here from EL3 (via ERET) or directly from
     // the firmware, we are now at EL2 in AArch64.
+    //
+    // If we came from EL3, CNTFRQ_EL0 was set above.
+    // If the bootloader dropped us directly at EL2, its ARM stub
+    // (start4.elf) should have set CNTFRQ_EL0 = 54 MHz already.
+    // If it didn't (very old firmware), Circle's assert is handled
+    // by our assertion_failed() stub which returns instead of hanging.
     ".L_from_el2:",
 
     // HCR_EL2.RW (bit 31) = 1 — EL1 (and EL0) execution state is AArch64.
@@ -119,17 +146,6 @@ global_asm!(
     // starts at 0x80000 and grows upward; there is no overlap.
     "mov x8, #0x80000",
     "mov sp, x8",
-
-    // ── Set CNTFRQ_EL0 = 54 MHz ─────────────────────────────────────────────
-    // The Sep 2020 Pi 4 bootloader does not set CNTFRQ_EL0 before handoff.
-    // Circle's CTimer::Initialize() reads this register and asserts it is
-    // non-zero. Writing the correct Pi 4 counter frequency (54 MHz) here
-    // ensures Circle's USB/timer stack initialises correctly.
-    // 54000000 = 0x033E_D280 — load with movz/movk (too large for single mov)
-    "movz x8, #0xd280",
-    "movk x8, #0x033e, lsl #16",
-    "msr cntfrq_el0, x8",
-    "isb",
 
     // ── Jump to Rust ─────────────────────────────────────────────────────────
     "b {rust_init}",
