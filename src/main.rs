@@ -116,6 +116,7 @@ pub extern "C" fn kernel_main() -> ! {
     kprint!("[kernel] USB HID:     ");
     #[cfg(feature = "bsp_rpi4")]
     {
+        kprintln!("calling circle_usb_init...");
         let usb_ok = usb_hid::usb_init();
         if usb_ok {
             kprintln!("OK (xHCI/VL805 via Circle)");
