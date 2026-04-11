@@ -92,6 +92,17 @@ pub fn getc() -> u8 {
     }
 }
 
+/// Read a single byte from UART without blocking.
+/// Returns 0 immediately if no data is available in the receive FIFO.
+pub fn getc_nonblocking() -> u8 {
+    unsafe {
+        if UART_FR.read_volatile() & FR_RXFE != 0 {
+            return 0; // FIFO empty
+        }
+        UART_DR.read_volatile() as u8
+    }
+}
+
 /// Print a string over UART.
 pub fn puts(s: &str) {
     for byte in s.bytes() {

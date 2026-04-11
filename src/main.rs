@@ -9,13 +9,16 @@
 //   4. kernel_main() → init UART
 //   5. kernel_main() → init framebuffer (HDMI)
 //   6. kernel_main() → init SD card (EMMC2) + FAT32
-//   7. kernel_main() → print boot banner + enter shell
+//   7. kernel_main() → init USB HID (Circle xHCI — Pi 4 only)
+//   8. kernel_main() → print boot banner + enter shell
 //
 // Shell commands:
 //   help, info, echo, clear, blink, halt
-//   sdinfo  — show SD card status
-//   ls      — list root directory of SD card
-//   cat     — print first 2KB of a file (8.3 name, e.g. "README.TXT")
+//   sdinfo          — show SD card status
+//   ls              — list root directory of SD card
+//   cat <FILE.EXT>  — print first 2KB of a file (8.3 name)
+//   usbinfo         — show USB keyboard/mouse status
+//   mouse           — print current mouse position and buttons
 
 #![no_std]
 #![no_main]
@@ -27,6 +30,7 @@ mod framebuffer;
 mod gpio;
 mod emmc;
 mod fat32;
+mod usb_hid;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -71,7 +75,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── Step 4: Boot banner ───────────────────────────────────────────────
     kprintln!("========================================");
-    kprintln!("  my-ai-os v0.2.0");
+    kprintln!("  my-ai-os v0.3.0");
     kprintln!("  Bare-Metal AArch64 AI Operating System");
     #[cfg(feature = "bsp_rpi4")]
     kprintln!("  Board: Raspberry Pi 4 (BCM2711)");
@@ -108,13 +112,49 @@ pub extern "C" fn kernel_main() -> ! {
         kprintln!("FAILED -- check SD card");
     }
 
+    // ── Step 6: USB HID init (Pi 4 only — Circle xHCI driver) ────────────
+    kprint!("[kernel] USB HID:     ");
+    #[cfg(feature = "bsp_rpi4")]
+    {
+        let usb_ok = usb_hid::usb_init();
+        if usb_ok {
+            kprintln!("OK (xHCI/VL805 via Circle)");
+            kprintln!("[kernel] USB:         Scanning for keyboard/mouse...");
+        } else {
+            kprintln!("FAILED -- check USB devices and config.txt");
+        }
+    }
+    #[cfg(not(feature = "bsp_rpi4"))]
+    {
+        kprintln!("N/A (QEMU/Pi3 -- no xHCI)");
+    }
+
     kprintln!("");
     kprintln!("[kernel] Entering shell...");
     kprintln!("Type 'help' for available commands.");
     kprintln!("");
 
-    // ── Step 6: Shell ─────────────────────────────────────────────────────
+    // ── Step 7: Shell ─────────────────────────────────────────────────────
     shell();
+}
+
+/// Read one character from either the USB keyboard (if connected) or UART.
+/// On Pi 3 / QEMU, always falls back to UART.
+fn getc() -> u8 {
+    loop {
+        // Drive Circle's plug-and-play loop every iteration
+        usb_hid::usb_update();
+
+        // Prefer USB keyboard when connected
+        if usb_hid::keyboard_ready() {
+            let c = usb_hid::keyboard_getc();
+            if c != 0 { return c; }
+        }
+
+        // Fall back to UART (serial cable / QEMU)
+        let c = uart::getc_nonblocking();
+        if c != 0 { return c; }
+    }
 }
 
 fn shell() -> ! {
@@ -125,7 +165,7 @@ fn shell() -> ! {
         kprint!("ai-os> ");
 
         loop {
-            let c = uart::getc();
+            let c = getc();
             match c {
                 b'\r' | b'\n' => {
                     kprintln!("");
@@ -183,11 +223,13 @@ fn execute(cmd: &str) {
             kprintln!("  sdinfo        - SD card status");
             kprintln!("  ls            - List SD card root directory");
             kprintln!("  cat <FILE.EXT>- Print file contents (8.3 name)");
+            kprintln!("  usbinfo       - USB keyboard/mouse status");
+            kprintln!("  mouse         - Current mouse position and buttons");
             kprintln!("  halt          - Halt the CPU");
         }
 
         "info" => {
-            kprintln!("my-ai-os v0.2.0");
+            kprintln!("my-ai-os v0.3.0");
             kprintln!("Architecture: AArch64 (ARM Cortex-A72)");
             #[cfg(feature = "bsp_rpi4")]
             kprintln!("Board:        Raspberry Pi 4 (BCM2711)");
@@ -195,6 +237,7 @@ fn execute(cmd: &str) {
             kprintln!("Board:        Raspberry Pi 3 (BCM2837)");
             kprintln!("UART:         PL011 @ 0x{:08X}", uart::base_address());
             kprintln!("Cores:        4 (1 active, 3 parked)");
+            kprintln!("USB stack:    Circle (C++) via Rust FFI");
         }
 
         "echo" => {
@@ -212,7 +255,6 @@ fn execute(cmd: &str) {
         }
 
         "sdinfo" => {
-            // Re-run init to report current state
             let sd_ok = emmc::sd_init();
             if sd_ok {
                 kprintln!("SD card: OK");
@@ -233,7 +275,6 @@ fn execute(cmd: &str) {
             kprintln!("  ------------------------------");
             let mut count = 0u32;
             fat32::fat32_list_root(|info| {
-                // Build display name from info.name bytes (null-terminated)
                 let mut name_str = [0u8; 13];
                 let mut ni = 0;
                 for &b in info.name.iter() {
@@ -242,7 +283,6 @@ fn execute(cmd: &str) {
                     ni += 1;
                 }
                 let name_display = core::str::from_utf8(&name_str[..ni]).unwrap_or("?");
-
                 if info.is_dir {
                     kprintln!("  {:<12} {:>10}  DIR", name_display, "");
                 } else {
@@ -261,8 +301,6 @@ fn execute(cmd: &str) {
                 return;
             }
 
-            // Parse "FILENAME.EXT" into an 8.3 space-padded array (uppercase).
-            // FAT32 stores names as 11-byte uppercase space-padded: "README  TXT"
             let mut name83 = [b' '; 11];
             let mut upper_buf = [0u8; 16];
             let arg_bytes = args.as_bytes();
@@ -272,16 +310,13 @@ fn execute(cmd: &str) {
             let dot_pos = upper_bytes.iter().position(|&b| b == b'.');
             match dot_pos {
                 Some(d) => {
-                    // Name part: up to 8 chars before the dot
                     let name_len = d.min(8);
                     for i in 0..name_len { name83[i] = upper_bytes[i]; }
-                    // Extension: up to 3 chars after the dot
                     let ext_src = &upper_bytes[(d + 1)..];
                     let ext_len = ext_src.len().min(3);
                     for i in 0..ext_len { name83[8 + i] = ext_src[i]; }
                 }
                 None => {
-                    // No extension — just fill name part
                     let name_len = upper_len.min(8);
                     for i in 0..name_len { name83[i] = upper_bytes[i]; }
                 }
@@ -290,10 +325,10 @@ fn execute(cmd: &str) {
             kprintln!("--- {} ---", args);
             let mut bytes_shown = 0usize;
             let found = fat32::fat32_read_file(&name83, |chunk, len| {
-                if bytes_shown >= 2048 { return; } // limit display to 2 KB
+                if bytes_shown >= 2048 { return; }
                 for &b in &chunk[..len] {
                     if bytes_shown >= 2048 { break; }
-                    if b == b'\r' { continue; } // skip CR in CRLF
+                    if b == b'\r' { continue; }
                     uart::putc(b);
                     let _ = write!(framebuffer::FbWriter, "{}", b as char);
                     bytes_shown += 1;
@@ -306,6 +341,50 @@ fn execute(cmd: &str) {
             } else {
                 kprintln!("");
                 kprintln!("--- end ---");
+            }
+        }
+
+        "usbinfo" => {
+            #[cfg(feature = "bsp_rpi4")]
+            {
+                if usb_hid::keyboard_ready() {
+                    kprintln!("Keyboard: CONNECTED (USB HID, Circle xHCI)");
+                } else {
+                    kprintln!("Keyboard: not detected");
+                    kprintln!("  -- ensure keyboard is plugged into a USB-A port");
+                    kprintln!("  -- config.txt must NOT have dtoverlay=dwc2");
+                }
+                if usb_hid::mouse_ready() {
+                    kprintln!("Mouse:    CONNECTED (USB HID, Circle xHCI)");
+                } else {
+                    kprintln!("Mouse:    not detected");
+                }
+            }
+            #[cfg(not(feature = "bsp_rpi4"))]
+            {
+                kprintln!("USB HID not available on this build (QEMU/Pi3).");
+                kprintln!("USB input uses the xHCI/VL805 controller on Pi 4 only.");
+            }
+        }
+
+        "mouse" => {
+            #[cfg(feature = "bsp_rpi4")]
+            {
+                if usb_hid::mouse_ready() {
+                    let (buttons, x, y) = usb_hid::mouse_get_state();
+                    kprintln!("Mouse position: ({}, {})", x, y);
+                    kprintln!("Buttons: left={} right={} middle={}",
+                        if buttons & 0x1 != 0 { "DOWN" } else { "up" },
+                        if buttons & 0x2 != 0 { "DOWN" } else { "up" },
+                        if buttons & 0x4 != 0 { "DOWN" } else { "up" },
+                    );
+                } else {
+                    kprintln!("No mouse connected. Plug in a USB mouse and try again.");
+                }
+            }
+            #[cfg(not(feature = "bsp_rpi4"))]
+            {
+                kprintln!("Mouse not available on this build (QEMU/Pi3).");
             }
         }
 

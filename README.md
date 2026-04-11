@@ -4,7 +4,7 @@ A bare-metal AI Operating System for AArch64, written in Rust.
 
 Runs directly on **Raspberry Pi 4** hardware with no Linux, no macOS, nothing underneath.
 
-**v0.2.0** — EMMC2 SD card driver + FAT32 filesystem parser added. Shell now supports `ls`, `cat`, and `sdinfo`.
+**v0.3.0** — USB HID keyboard and mouse added via Circle's xHCI/VL805 driver (C++ FFI). Shell now accepts input from USB keyboard. New commands: `usbinfo`, `mouse`.
 
 ![Running on real Pi 4 hardware](20260411_150830.jpg)
 
@@ -39,20 +39,26 @@ ai-os> _
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│  Shell (main.rs)                    │  ← interactive command loop
-├─────────────────────────────────────┤
-│  FAT32 Parser      (fat32.rs)       │  ← MBR→BPB→directory→file read
-│  EMMC2 SD Driver   (emmc.rs)        │  ← BCM2711 SD @ 0xFE340000
-│  HDMI Text Console (framebuffer.rs) │  ← bitmap font renderer
-│  UART Driver       (uart.rs)        │  ← PL011 MMIO driver
-│  GPIO Driver       (gpio.rs)        │  ← activity LED control
-│  GPU Mailbox       (mailbox.rs)     │  ← property channel IPC
-├─────────────────────────────────────┤
-│  Boot / EL2 Setup  (boot.rs)        │  ← assembly entry point
-│  Linker Script     (linker.ld)      │  ← memory layout @ 0x80000
-└─────────────────────────────────────┘
-         Raspberry Pi 4 BCM2711
+┌─────────────────────────────────────────────────────────┐
+│  Shell (main.rs)                                        │  ← interactive command loop
+├─────────────────────────────────────────────────────────┤
+│  USB HID FFI       (usb_hid.rs)                         │  ← Rust FFI → Circle C++ shim
+│  FAT32 Parser      (fat32.rs)                           │  ← MBR→BPB→directory→file read
+│  EMMC2 SD Driver   (emmc.rs)                            │  ← BCM2711 SD @ 0xFE340000
+│  HDMI Text Console (framebuffer.rs)                     │  ← bitmap font renderer
+│  UART Driver       (uart.rs)                            │  ← PL011 MMIO driver
+│  GPIO Driver       (gpio.rs)                            │  ← activity LED control
+│  GPU Mailbox       (mailbox.rs)                         │  ← property channel IPC
+├─────────────────────────────────────────────────────────┤
+│  circle_shim/circle_usb_shim.cpp  (C++, extern "C")     │  ← wraps Circle classes
+│    ├── Circle libcircle.a  (interrupt, timer, PCIe)     │
+│    ├── Circle libusb.a     (xHCI, VL805, USB stack)     │
+│    └── Circle libinput.a   (keyboard/mouse behaviour)   │
+├─────────────────────────────────────────────────────────┤
+│  Boot / EL2 Setup  (boot.rs)                            │  ← assembly entry point
+│  Linker Script     (linker.ld)                          │  ← memory layout @ 0x80000
+└─────────────────────────────────────────────────────────┘
+              Raspberry Pi 4 BCM2711
 ```
 
 ## Build
@@ -76,6 +82,16 @@ brew install qemu                       # macOS
 ```
 
 ### Build for Raspberry Pi 4 (real hardware)
+
+First, clone Circle alongside this repo and configure it:
+
+```bash
+git clone --depth=1 https://github.com/rsta2/circle.git ~/circle
+cd ~/circle && ./configure -r 4 -p aarch64-linux-gnu- --c++17 -f
+sudo apt install g++-aarch64-linux-gnu   # if not already installed
+```
+
+Then build the kernel (build.rs compiles Circle automatically):
 
 ```bash
 cargo build --release --no-default-features --features bsp_rpi4
@@ -125,6 +141,8 @@ make rpi4       # build Pi 4 kernel8.img
 | `sdinfo` | Show SD card and FAT32 status |
 | `ls` | List files in the SD card root directory |
 | `cat <FILE.EXT>` | Print file contents (8.3 format, e.g. `README.TXT`) |
+| `usbinfo` | Show USB keyboard/mouse connection status |
+| `mouse` | Show current mouse position and button state |
 | `halt` | Halt the CPU |
 
 ## Roadmap
@@ -137,6 +155,9 @@ make rpi4       # build Pi 4 kernel8.img
 - [x] EMMC2 SD card driver (BCM2711 @ 0xFE340000)
 - [x] FAT32 filesystem parser (MBR, BPB, FAT chain, directory, file read)
 - [x] Shell commands: `ls`, `cat`, `sdinfo`
+- [x] USB HID keyboard driver (Circle xHCI/VL805 via Rust FFI)
+- [x] USB HID mouse driver (Circle xHCI/VL805 via Rust FFI)
+- [x] Shell commands: `usbinfo`, `mouse`
 - [ ] Port `llama2.c` to `no_std` Rust (`llm.rs`)
 - [ ] `ask <prompt>` command — LLM inference at EL2
 - [ ] System timer + interrupts

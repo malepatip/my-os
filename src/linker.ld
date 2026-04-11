@@ -7,24 +7,49 @@ SECTIONS
 {
     . = 0x80000;
 
-    .text : {
-        KEEP(*(.text._start))   /* Entry point MUST be first */
-        *(.text .text.*)
+    /* Entry stub */
+    .init : {
+        KEEP(*(.init))
     }
 
+    /* Code */
+    .text : {
+        KEEP(*(.text._start))   /* Rust entry point must be first */
+        *(.text .text.*)
+        _etext = .;             /* Circle: end of text */
+    }
+
+    /* Read-only data */
     .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
     }
 
+    /* C++ global constructors — Circle calls these via __init_start/__init_end */
+    .init_array : ALIGN(8) {
+        __init_start = .;
+        KEEP(*(.init_array .init_array.*))
+        __init_end = .;
+    }
+
+    /* ARM exception index — Circle references these even in AArch64 mode */
+    .ARM.exidx : {
+        __exidx_start = .;
+        *(.ARM.exidx*)
+        __exidx_end = .;
+    }
+
+    /* Initialised data */
     .data : ALIGN(4096) {
         *(.data .data.*)
     }
 
+    /* Zero-initialised data */
     .bss : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
+        _end = .;               /* Circle: end of BSS / start of heap */
     }
 
     /DISCARD/ : {
