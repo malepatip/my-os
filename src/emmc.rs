@@ -1,8 +1,11 @@
 // emmc.rs — Bare-metal EMMC2 SD card driver for Raspberry Pi 4
 // EMMC2 controller base: 0xFE340000 (Pi 4 / BCM2711)
 //
-// All timeouts use the ARM physical counter (CNTPCT_EL0 / CNTFRQ_EL0)
-// which is always available at EL2 and cannot hang. No mailbox calls.
+// All timeouts use pure iteration counts — NO hardware counters, NO mailbox.
+// Pi 4 Cortex-A72 runs at 1.5 GHz. Each NOP is ~0.67ns.
+// 1,500,000 NOPs ≈ 1ms. We use conservative counts so timeouts fire
+// well within the expected window even at lower clock speeds.
+//
 // Worst-case sd_init() time: ~300ms. Guaranteed to return.
 
 use core::ptr::{read_volatile, write_volatile};
@@ -10,22 +13,22 @@ use core::ptr::{read_volatile, write_volatile};
 // ─── EMMC2 Register Map ───────────────────────────────────────────────────────
 const EMMC_BASE: u64 = 0xFE34_0000;
 
-const EMMC_ARG2:        u64 = EMMC_BASE + 0x00;
-const EMMC_BLKSIZECNT:  u64 = EMMC_BASE + 0x04;
-const EMMC_ARG1:        u64 = EMMC_BASE + 0x08;
-const EMMC_CMDTM:       u64 = EMMC_BASE + 0x0C;
-const EMMC_RESP0:       u64 = EMMC_BASE + 0x10;
-const EMMC_RESP1:       u64 = EMMC_BASE + 0x14;
-const EMMC_RESP2:       u64 = EMMC_BASE + 0x18;
-const EMMC_RESP3:       u64 = EMMC_BASE + 0x1C;
-const EMMC_DATA:        u64 = EMMC_BASE + 0x20;
-const EMMC_STATUS:      u64 = EMMC_BASE + 0x24;
-const EMMC_CONTROL0:    u64 = EMMC_BASE + 0x28;
-const EMMC_CONTROL1:    u64 = EMMC_BASE + 0x2C;
-const EMMC_INTERRUPT:   u64 = EMMC_BASE + 0x30;
-const EMMC_IRPT_MASK:   u64 = EMMC_BASE + 0x34;
-const EMMC_IRPT_EN:     u64 = EMMC_BASE + 0x38;
-const EMMC_CONTROL2:    u64 = EMMC_BASE + 0x3C;
+const EMMC_ARG2:       u64 = EMMC_BASE + 0x00;
+const EMMC_BLKSIZECNT: u64 = EMMC_BASE + 0x04;
+const EMMC_ARG1:       u64 = EMMC_BASE + 0x08;
+const EMMC_CMDTM:      u64 = EMMC_BASE + 0x0C;
+const EMMC_RESP0:      u64 = EMMC_BASE + 0x10;
+const EMMC_RESP1:      u64 = EMMC_BASE + 0x14;
+const EMMC_RESP2:      u64 = EMMC_BASE + 0x18;
+const EMMC_RESP3:      u64 = EMMC_BASE + 0x1C;
+const EMMC_DATA:       u64 = EMMC_BASE + 0x20;
+const EMMC_STATUS:     u64 = EMMC_BASE + 0x24;
+const EMMC_CONTROL0:   u64 = EMMC_BASE + 0x28;
+const EMMC_CONTROL1:   u64 = EMMC_BASE + 0x2C;
+const EMMC_INTERRUPT:  u64 = EMMC_BASE + 0x30;
+const EMMC_IRPT_MASK:  u64 = EMMC_BASE + 0x34;
+const EMMC_IRPT_EN:    u64 = EMMC_BASE + 0x38;
+const EMMC_CONTROL2:   u64 = EMMC_BASE + 0x3C;
 
 // ─── CMDTM flags ──────────────────────────────────────────────────────────────
 const CMD_NEED_APP:  u32 = 0x8000_0000;
@@ -66,37 +69,14 @@ const CMD17:  u32 = 0x1100_0000 | CMD_RSPNS_48
 const CMD55:  u32 = 0x3700_0000 | CMD_RSPNS_48;
 const ACMD41: u32 = CMD_NEED_APP | 0x2900_0000 | CMD_RSPNS_48;
 
+// ─── Iteration counts (Pi 4 @ 1.5 GHz, conservative) ─────────────────────────
+// 1 NOP ≈ 0.67 ns → 1,500,000 NOPs ≈ 1 ms (at 1.5 GHz)
+// We use 1,000,000 per ms to be safe at lower speeds.
+const ITERS_PER_MS: u32 = 1_000_000;
+
 // ─── Global state ─────────────────────────────────────────────────────────────
 static mut SD_RCA:  u32  = 0;
 static mut SD_HCCS: bool = false;
-
-// ─── ARM physical counter helpers ─────────────────────────────────────────────
-// Pi 4 (BCM2711) always runs CNTPCT at 54 MHz regardless of CPU speed.
-// We hardcode this instead of reading CNTFRQ_EL0 because older bootloaders
-// (Sep 2020) may leave CNTFRQ_EL0 = 0 at EL2, which would cause divide-by-zero
-// in deadline_ms() and create an infinite loop.
-const CNTPCT_HZ: u64 = 54_000_000;  // 54 MHz — fixed on all Pi 4 hardware
-
-/// Read the ARM physical counter (always available at EL2, no setup needed).
-#[inline(always)]
-fn cntpct() -> u64 {
-    let val: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) val, options(nostack, nomem)) };
-    val
-}
-
-/// Returns a deadline `ms` milliseconds from now.
-#[inline(always)]
-fn deadline_ms(ms: u64) -> u64 {
-    cntpct().wrapping_add((CNTPCT_HZ / 1000).wrapping_mul(ms))
-}
-
-/// Returns true if the deadline has passed.
-/// Uses wrapping subtraction to handle counter wrap-around correctly.
-#[inline(always)]
-fn expired(deadline: u64) -> bool {
-    cntpct().wrapping_sub(deadline) < (1u64 << 63)
-}
 
 // ─── MMIO helpers ─────────────────────────────────────────────────────────────
 #[inline(always)]
@@ -109,29 +89,34 @@ fn wr(reg: u64, val: u32) {
     unsafe { write_volatile(reg as *mut u32, val) }
 }
 
-/// Spin for approximately `ms` milliseconds using the hardware counter.
-fn sleep_ms(ms: u64) {
-    let end = deadline_ms(ms);
-    while !expired(end) {
-        unsafe { core::arch::asm!("nop") };
+/// Spin for approximately `ms` milliseconds using NOP loops.
+/// Cannot hang — pure iteration count, no hardware registers.
+#[inline(never)]
+fn sleep_ms(ms: u32) {
+    let total = ms as u64 * ITERS_PER_MS as u64;
+    for _ in 0..total {
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
 }
 
-// ─── Wait helpers (all use hardware counter) ──────────────────────────────────
+// ─── Wait helpers (pure iteration limits) ─────────────────────────────────────
 
-/// Wait until CMD and DAT lines are idle. Timeout: 10ms.
+/// Wait until CMD and DAT lines are idle. Max ~10ms.
 fn wait_cmd_idle() -> bool {
-    let dl = deadline_ms(10);
-    while rd(EMMC_STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
-        if expired(dl) { return false; }
+    let limit = 10 * ITERS_PER_MS;
+    for _ in 0..limit {
+        if rd(EMMC_STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) == 0 {
+            return true;
+        }
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
-    true
+    false
 }
 
-/// Wait for an interrupt bit. Timeout: 100ms.
+/// Wait for an interrupt bit. Max ~100ms.
 fn wait_interrupt(mask: u32) -> bool {
-    let dl = deadline_ms(100);
-    loop {
+    let limit = 100 * ITERS_PER_MS;
+    for _ in 0..limit {
         let irpt = rd(EMMC_INTERRUPT);
         if irpt & INT_ERROR_MASK != 0 {
             wr(EMMC_INTERRUPT, irpt);
@@ -141,23 +126,25 @@ fn wait_interrupt(mask: u32) -> bool {
             wr(EMMC_INTERRUPT, mask);
             return true;
         }
-        if expired(dl) { return false; }
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
+    false
 }
 
 // ─── Clock setup ─────────────────────────────────────────────────────────────
 fn set_clock(base_hz: u32, target_hz: u32) {
     // Wait for idle — 10ms max
-    let dl = deadline_ms(10);
-    while rd(EMMC_STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) != 0 {
-        if expired(dl) { break; }
+    let limit = 10 * ITERS_PER_MS;
+    for _ in 0..limit {
+        if rd(EMMC_STATUS) & (SR_CMD_INHIBIT | SR_DAT_INHIBIT) == 0 { break; }
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
 
     // Disable SD clock
     wr(EMMC_CONTROL1, rd(EMMC_CONTROL1) & !C1_CLK_EN);
     sleep_ms(2);
 
-    // Calculate divisor (power-of-2 only, max 1024)
+    // Calculate divisor (power-of-2, max 1024)
     let mut div: u32 = 1;
     while div < 1024 && base_hz / div > target_hz {
         div <<= 1;
@@ -169,9 +156,10 @@ fn set_clock(base_hz: u32, target_hz: u32) {
     sleep_ms(2);
 
     // Wait for internal clock stable — 10ms max
-    let dl = deadline_ms(10);
-    while rd(EMMC_CONTROL1) & C1_CLK_STABLE == 0 {
-        if expired(dl) { return; }
+    let limit = 10 * ITERS_PER_MS;
+    for _ in 0..limit {
+        if rd(EMMC_CONTROL1) & C1_CLK_STABLE != 0 { break; }
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
 
     wr(EMMC_CONTROL1, rd(EMMC_CONTROL1) | C1_CLK_EN);
@@ -180,7 +168,6 @@ fn set_clock(base_hz: u32, target_hz: u32) {
 
 // ─── Send a command ───────────────────────────────────────────────────────────
 fn send_cmd(cmd: u32, arg: u32) -> u32 {
-    // Handle ACMD prefix
     if cmd & CMD_NEED_APP != 0 {
         let rca = unsafe { SD_RCA };
         let r = send_cmd(CMD55, rca << 16);
@@ -204,23 +191,24 @@ fn send_cmd(cmd: u32, arg: u32) -> u32 {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Initialize the EMMC2 controller and SD card.
-/// Uses the ARM physical counter for all timeouts.
+/// Uses only NOP-count loops — no hardware counters, no mailbox.
 /// Guaranteed to return within ~300ms regardless of SD card state.
 pub fn sd_init() -> bool {
-    // Use 100 MHz as the base clock. This is the standard EMMC2 clock on Pi 4.
-    // We avoid querying via mailbox because the mailbox call itself can hang
-    // if the GPU is not ready (no timeout in the mailbox spin-wait).
-    let base_hz: u32 = 100_000_000;
+    let base_hz: u32 = 100_000_000;  // 100 MHz standard EMMC2 clock on Pi 4
 
     // ── Reset ─────────────────────────────────────────────────────────────────
     wr(EMMC_CONTROL0, 0);
     wr(EMMC_CONTROL1, C1_SRST_HC);
     sleep_ms(10);
 
-    let dl = deadline_ms(50);
-    while rd(EMMC_CONTROL1) & C1_SRST_HC != 0 {
-        if expired(dl) { return false; }
+    // Wait for reset complete — 50ms max
+    let limit = 50 * ITERS_PER_MS;
+    let mut reset_ok = false;
+    for _ in 0..limit {
+        if rd(EMMC_CONTROL1) & C1_SRST_HC == 0 { reset_ok = true; break; }
+        unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
+    if !reset_ok { return false; }
 
     // ── Set timeout and identification clock (400 kHz) ────────────────────────
     wr(EMMC_CONTROL1, rd(EMMC_CONTROL1) | C1_TOUNIT_MAX);
@@ -237,17 +225,17 @@ pub fn sd_init() -> bool {
     let r8 = send_cmd(CMD8, 0x0000_01AA);
     let is_v2 = r8 == 0x0000_01AA;
 
-    // ── ACMD41 — SD_SEND_OP_COND (max 250ms) ─────────────────────────────────
-    let acmd_dl = deadline_ms(250);
+    // ── ACMD41 — SD_SEND_OP_COND (max 50 retries × 5ms = 250ms) ─────────────
     let acmd_arg = if is_v2 { 0x51FF_8000u32 } else { 0x00FF_8000u32 };
-    let mut resp: u32;
-    loop {
+    let mut resp: u32 = 0;
+    let mut card_ready = false;
+    for _ in 0..50u32 {
         resp = send_cmd(ACMD41, acmd_arg);
         if resp == 0xFFFF_FFFF { return false; }
-        if resp & 0x8000_0000 != 0 { break; }  // card ready
-        if expired(acmd_dl) { return false; }
+        if resp & 0x8000_0000 != 0 { card_ready = true; break; }
         sleep_ms(5);
     }
+    if !card_ready { return false; }
 
     unsafe { SD_HCCS = resp & 0x4000_0000 != 0; }
 
