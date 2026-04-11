@@ -10,7 +10,7 @@ lto = true
 panic = "abort"
 
 [features]
-default = ["bsp_rpi3"]
+default = ["bsp_rpi4"]
 bsp_rpi3 = []    # Raspberry Pi 3 — QEMU development (peripheral base 0x3F000000)
 bsp_rpi4 = []    # Raspberry Pi 4 — Real hardware    (peripheral base 0xFE000000)
 
