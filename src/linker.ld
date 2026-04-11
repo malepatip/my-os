@@ -7,15 +7,11 @@ SECTIONS
 {
     . = 0x80000;
 
-    /* Entry stub */
-    .init : {
-        KEEP(*(.init))
-    }
-
-    /* Code */
+    /* Code — Rust _start MUST be first at 0x80000 */
     .text : {
         KEEP(*(.text._start))   /* Rust entry point must be first */
         *(.text .text.*)
+        *(.init)                /* absorb Circle's .init here, after our _start */
         _etext = .;             /* Circle: end of text */
     }
 
