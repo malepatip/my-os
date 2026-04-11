@@ -71,6 +71,12 @@ static mut SD_RCA:  u32  = 0;
 static mut SD_HCCS: bool = false;
 
 // ─── ARM physical counter helpers ─────────────────────────────────────────────
+// Pi 4 (BCM2711) always runs CNTPCT at 54 MHz regardless of CPU speed.
+// We hardcode this instead of reading CNTFRQ_EL0 because older bootloaders
+// (Sep 2020) may leave CNTFRQ_EL0 = 0 at EL2, which would cause divide-by-zero
+// in deadline_ms() and create an infinite loop.
+const CNTPCT_HZ: u64 = 54_000_000;  // 54 MHz — fixed on all Pi 4 hardware
+
 /// Read the ARM physical counter (always available at EL2, no setup needed).
 #[inline(always)]
 fn cntpct() -> u64 {
@@ -79,25 +85,17 @@ fn cntpct() -> u64 {
     val
 }
 
-/// Read the counter frequency in Hz.
-#[inline(always)]
-fn cntfrq() -> u64 {
-    let val: u64;
-    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) val, options(nostack, nomem)) };
-    val
-}
-
 /// Returns a deadline `ms` milliseconds from now.
 #[inline(always)]
 fn deadline_ms(ms: u64) -> u64 {
-    let freq = cntfrq();
-    cntpct() + (freq / 1000) * ms
+    cntpct().wrapping_add((CNTPCT_HZ / 1000).wrapping_mul(ms))
 }
 
 /// Returns true if the deadline has passed.
+/// Uses wrapping subtraction to handle counter wrap-around correctly.
 #[inline(always)]
 fn expired(deadline: u64) -> bool {
-    cntpct() >= deadline
+    cntpct().wrapping_sub(deadline) < (1u64 << 63)
 }
 
 // ─── MMIO helpers ─────────────────────────────────────────────────────────────
