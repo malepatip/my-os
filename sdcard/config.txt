@@ -1,5 +1,14 @@
+# config.txt — my-ai-os v0.3.0
+# Raspberry Pi 4 Model B
+
+# ── Boot ─────────────────────────────────────────────────────────────────────────────
 arm_64bit=1
 kernel=kernel8.img
+
+# ── USB ─────────────────────────────────────────────────────────────────────────────
+# DO NOT add dtoverlay=dwc2 here.
+# That would disable the VL805 xHCI chip driving the USB-A ports.
+# Plug keyboard and mouse into the USB-A ports (the rectangular ones).
 
 # ── UART ─────────────────────────────────────────────────────────────────────
 # Lock core clock so PL011 UART baud rate divisors are stable.
@@ -15,13 +24,13 @@ hdmi_drive=2
 # Disable black border (overscan)
 disable_overscan=1
 
-# Force 1280x720 @ 60Hz (CEA mode 4) — matches our kernel framebuffer resolution
+# Force 1920x1080 @ 60Hz (CEA mode 16)
 hdmi_group=1
-hdmi_mode=4
+hdmi_mode=16
 
-# Set framebuffer to exactly 1280x720 @ 32bpp
-framebuffer_width=1280
-framebuffer_height=720
+# Set framebuffer to exactly 1920x1080 @ 32bpp
+framebuffer_width=1920
+framebuffer_height=1080
 framebuffer_depth=32
 
 # Disable the rainbow splash screen
