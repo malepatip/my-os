@@ -33,7 +33,7 @@
 //   PC = kernel entry point (vmlinuz load address)
 //   EL = EL1 (via SPSR_EL2 + ELR_EL2 + ERET)
 
-use core::sync::atomic::{AtomicBool, Ordering};
+// (atomic imports removed — not needed)
 
 // ── Memory addresses ─────────────────────────────────────────────────────────
 
@@ -57,14 +57,32 @@ const PT_POOL_SIZE: usize = 64 * 1024; // 64KB
 pub const SHMEM_MAGIC: u32 = 0xAA55AA55;
 
 // ── Shared memory layout ─────────────────────────────────────────────────────
+//
+// MUST match hid_daemon.c exactly (same offsets, same field sizes):
+//   Offset 0:   magic (u32)      = SHMEM_MAGIC when Linux ready
+//   Offset 4:   write_idx (u32)  = next slot Linux writes
+//   Offset 8:   read_idx  (u32)  = next slot EL2 reads
+//   Offset 12:  _pad (u32)
+//   Offset 16:  ring[256] (u8)   = ASCII keystrokes
+//   Offset 272: mouse_x (i32)    = accumulated X delta
+//   Offset 276: mouse_y (i32)    = accumulated Y delta
+//   Offset 280: mouse_btns (u8)  = bit0=left, bit1=right, bit2=mid
+//   Offset 281: mouse_flags (u8) = bit0=new_event
 
+// All fields are naturally aligned — no packing needed.
+// Layout matches hid_daemon.c exactly because C also uses natural alignment.
 #[repr(C)]
 pub struct SharedMem {
-    pub magic:     u32,  // SHMEM_MAGIC when Linux is ready
-    pub write_idx: u32,  // next slot Linux will write
-    pub read_idx:  u32,  // next slot we will read
-    pub _pad:      u32,
-    pub ring:      [u8; 256], // ASCII keystrokes ring buffer
+    pub magic:       u32,       // +0
+    pub write_idx:   u32,       // +4
+    pub read_idx:    u32,       // +8
+    pub _pad:        u32,       // +12
+    pub ring:        [u8; 256], // +16  ASCII keyboard ring
+    pub mouse_x:     i32,       // +272 mouse X delta
+    pub mouse_y:     i32,       // +276 mouse Y delta
+    pub mouse_btns:  u8,        // +280 button state
+    pub mouse_flags: u8,        // +281 bit0=new event
+    pub _pad2:       [u8; 2],   // +282 alignment
 }
 
 impl SharedMem {
@@ -73,19 +91,39 @@ impl SharedMem {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.magic == SHMEM_MAGIC
+        let m = unsafe { core::ptr::read_volatile(&self.magic as *const u32) };
+        m == SHMEM_MAGIC
     }
 
-    /// Read one ASCII character from the ring buffer, or None if empty.
+    /// Read one ASCII character from the keyboard ring buffer, or None if empty.
     pub fn read_char(&mut self) -> Option<u8> {
-        let widx = unsafe { core::ptr::read_volatile(&self.write_idx) };
-        let ridx = self.read_idx;
+        let widx = unsafe { core::ptr::read_volatile(&self.write_idx as *const u32) };
+        let ridx = unsafe { core::ptr::read_volatile(&self.read_idx  as *const u32) };
         if ridx == widx {
             return None;
         }
-        let ch = unsafe { core::ptr::read_volatile(&self.ring[ridx as usize % 256]) };
-        self.read_idx = ridx.wrapping_add(1) % 256;
+        let idx = (ridx as usize) % 256;
+        let ch = unsafe { core::ptr::read_volatile(&self.ring[idx] as *const u8) };
+        unsafe { core::ptr::write_volatile(&mut self.read_idx as *mut u32, ridx.wrapping_add(1)) };
         Some(ch)
+    }
+
+    /// Read mouse delta and button state. Returns (dx, dy, buttons) if new event.
+    pub fn read_mouse(&mut self) -> Option<(i32, i32, u8)> {
+        let flags = unsafe { core::ptr::read_volatile(&self.mouse_flags as *const u8) };
+        if flags & 0x01 == 0 {
+            return None;
+        }
+        let dx   = unsafe { core::ptr::read_volatile(&self.mouse_x    as *const i32) };
+        let dy   = unsafe { core::ptr::read_volatile(&self.mouse_y    as *const i32) };
+        let btns = unsafe { core::ptr::read_volatile(&self.mouse_btns as *const u8) };
+        // Consume the event — reset deltas and clear flag
+        unsafe {
+            core::ptr::write_volatile(&mut self.mouse_x    as *mut i32, 0);
+            core::ptr::write_volatile(&mut self.mouse_y    as *mut i32, 0);
+            core::ptr::write_volatile(&mut self.mouse_flags as *mut u8, flags & !0x01);
+        }
+        Some((dx, dy, btns))
     }
 }
 
