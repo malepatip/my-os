@@ -1,14 +1,10 @@
-# config.txt — my-ai-os v0.3.0
+# config.txt — ai-os v0.4.0
 # Raspberry Pi 4 Model B
+# EL2 Thin Hypervisor + Linux Driver VM
 
 # ── Boot ─────────────────────────────────────────────────────────────────────────────
 arm_64bit=1
 kernel=kernel8.img
-
-# ── USB ─────────────────────────────────────────────────────────────────────────────
-# DO NOT add dtoverlay=dwc2 here.
-# That would disable the VL805 xHCI chip driving the USB-A ports.
-# Plug keyboard and mouse into the USB-A ports (the rectangular ones).
 
 # ── UART ─────────────────────────────────────────────────────────────────────
 # Lock core clock so PL011 UART baud rate divisors are stable.

@@ -1,4 +1,5 @@
-/* Linker script for AArch64 bare-metal kernel on Raspberry Pi 3/4 */
+/* Linker script for AArch64 bare-metal kernel on Raspberry Pi 4 */
+/* ai-os v0.4.0 — EL2 Thin Hypervisor */
 /* The RPi firmware loads the kernel at 0x80000 */
 
 ENTRY(_start)
@@ -11,27 +12,13 @@ SECTIONS
     .text : {
         KEEP(*(.text._start))   /* Rust entry point must be first */
         *(.text .text.*)
-        *(.init)                /* absorb Circle's .init here, after our _start */
-        _etext = .;             /* Circle: end of text */
+        *(.init)
+        _etext = .;
     }
 
     /* Read-only data */
     .rodata : ALIGN(4096) {
         *(.rodata .rodata.*)
-    }
-
-    /* C++ global constructors — Circle calls these via __init_start/__init_end */
-    .init_array : ALIGN(8) {
-        __init_start = .;
-        KEEP(*(.init_array .init_array.*))
-        __init_end = .;
-    }
-
-    /* ARM exception index — Circle references these even in AArch64 mode */
-    .ARM.exidx : {
-        __exidx_start = .;
-        *(.ARM.exidx*)
-        __exidx_end = .;
     }
 
     /* Initialised data */
@@ -45,12 +32,14 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
-        _end = .;               /* Circle: end of BSS / start of heap */
+        _end = .;
     }
 
     /DISCARD/ : {
         *(.comment)
         *(.note*)
         *(.eh_frame*)
+        *(.init_array*)
+        *(.ARM.exidx*)
     }
 }

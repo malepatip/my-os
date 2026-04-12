@@ -1,42 +1,26 @@
 // SPDX-License-Identifier: MIT
 //
-// boot.rs — AArch64 bare-metal boot code for Raspberry Pi 4
+// boot.rs — AArch64 bare-metal boot code for ai-os v0.4.0
 //
-// Boot sequence:
+// Boot sequence (core 0):
 //   _start (EL3 or EL2)
 //     → EL3: set SCR_EL3, CNTFRQ_EL0=54MHz, ERET to EL2
-//     → EL2: configure HCR_EL2, CNTHCTL_EL2, SCTLR_EL1,
-//             set SP_EL1 (exception stack), set VBAR_EL1,
-//             ERET to EL1t
-//     → EL1t: set kernel stack (SP_EL0), call rust_init()
+//     → EL2: configure CNTHCTL_EL2, CPTR_EL2, set up EL2 stack,
+//             set VBAR_EL2, call rust_init() — STAY AT EL2
 //
-// WHY EL1?
-//   Circle's interrupt/timer/USB subsystem is designed to run at EL1.
-//   It sets VBAR_EL1 and uses EL1 system registers (ELR_EL1, SPSR_EL1,
-//   SP_EL1, etc.). Running at EL2 without a proper VBAR_EL2 means any
-//   IRQ (e.g. the physical timer IRQ that CTimer arms) jumps to address
-//   0x0 and the CPU dies silently.
+// Cores 1-3:
+//   Park in WFE. Core 1 will be released by kernel_main() via
+//   the Pi 4 spin table to run the Linux driver VM at EL1.
 //
-// WHY EL1t (not EL1h)?
-//   Circle's startup64.S drops to EL1t (SPSR_EL2 = 0x3c4). In EL1t:
-//     - Normal code uses SP_EL0 (kernel stack at 0x2A0000)
-//     - Exception/IRQ handlers automatically switch to SP_EL1 (0x308000)
-//   This gives separate stacks for kernel and IRQ handlers, which is
-//   what Circle's exceptionstub64.S expects.
+// WHY STAY AT EL2?
+//   ai-os is a Type-1 hypervisor. It owns EL2 and controls the
+//   Linux driver VM at EL1. All hardware access (UART, framebuffer,
+//   GPIO, SD card) is done directly from EL2 — no Circle needed.
 //
-// .init_array (C++ static constructors):
-//   Circle uses C++ classes (CInterruptSystem, CTimer, CXHCIDevice, etc.)
-//   as file-scope statics. Their constructors are registered in .init_array.
-//   Without calling these constructors, all Circle objects are zero-
-//   initialized: vtable pointers are NULL, member variables are wrong,
-//   and the first method call crashes or hangs.
-//   rust_init() iterates over .init_array AFTER zeroing BSS and BEFORE
-//   calling kernel_main().
-//
-// CNTFRQ_EL0 note:
-//   CNTFRQ_EL0 is READ-ONLY at EL2 and below. It can only be written
-//   from EL3. On Pi 4 with an updated bootloader, start4.elf's ARM stub
-//   sets CNTFRQ_EL0 = 54 MHz before handing off at EL2.
+// VBAR_EL2:
+//   We set VBAR_EL2 to a minimal exception handler table that
+//   prints a panic message and halts. This catches any unexpected
+//   exceptions at EL2 (e.g. stage-2 page table faults during setup).
 
 use core::arch::global_asm;
 
@@ -58,6 +42,7 @@ global_asm!(
     "b.eq .L_from_el3",
     "cmp x9, #2",
     "b.eq .L_from_el2",
+    // If we're at EL1 somehow, park (shouldn't happen)
     "b .L_park",
 
     // ── EL3 → EL2 transition ────────────────────────────────────────────────
@@ -68,7 +53,7 @@ global_asm!(
     "orr x8, x8, #(1 << 8)",     // HCE
     "orr x8, x8, #(1 << 10)",    // RW
     "msr scr_el3, x8",
-    // SPSR_EL3: EL2h, DAIF all masked. 0x3C9 = 0b11_1100_1001
+    // SPSR_EL3: EL2h (0b1001), DAIF all masked. 0x3C9 = 0b11_1100_1001
     "mov x8, #0x3c9",
     "msr spsr_el3, x8",
     // CNTFRQ_EL0 = 54 MHz (only writable at EL3). 54000000 = 0x033E_D280
@@ -80,13 +65,16 @@ global_asm!(
     "msr elr_el3, x8",
     "eret",
 
-    // ── EL2 setup + drop to EL1 ─────────────────────────────────────────────
+    // ── EL2 setup — STAY AT EL2 ─────────────────────────────────────────────
     // We arrive here either from EL3 (via ERET above) or directly from
-    // the updated bootloader (which boots into EL2).
+    // the Pi 4 bootloader (which boots at EL2 by default).
     ".L_from_el2:",
 
-    // HCR_EL2.RW (bit 31) = 1 — EL1 execution state is AArch64.
-    "mov x8, #(1 << 31)",
+    // HCR_EL2: RW=1 (EL1 is AArch64). VM=0 for now (stage-2 off until
+    // kernel_main() calls setup_stage2_tables()).
+    // TGE=0 (EL1 is a guest, not host). We don't set VM=1 here because
+    // we haven't set up page tables yet.
+    "mov x8, #(1 << 31)",        // RW=1
     "msr hcr_el2, x8",
     "isb",
 
@@ -98,62 +86,28 @@ global_asm!(
     // Zero virtual timer offset so EL1 virtual time == physical time.
     "msr cntvoff_el2, xzr",
 
-    // NOTE: CNTFRQ_EL0 is NOT writable from EL2 on this Pi 4 firmware.
-    // Writing it causes a synchronous exception (blank screen).
-    // Instead, we override CTimer::SimpleMsDelay/GetClockTicks in the
-    // C++ shim to use a hardcoded 54 MHz value.
+    // NOTE: CNTFRQ_EL0 is READ-ONLY at EL2. Do NOT write it here.
+    // The Pi 4 bootloader (start4.elf) sets it to 54 MHz before handing
+    // off at EL2. If we came from EL3, we already set it above.
 
-    // Disable coprocessor traps to EL2.
+    // Disable coprocessor traps to EL2 (allow EL1 to use FP/SIMD/SVE).
     "mov x8, #0x33ff",
     "msr cptr_el2, x8",
     "msr hstr_el2, xzr",
 
-    // Enable FP/SIMD at EL1 (CPACR_EL1 bits [21:20] = 0b11).
-    "mov x8, #(3 << 20)",
-    "msr cpacr_el1, x8",
-
-    // SCTLR_EL1: RES1 bits set, MMU off, caches off.
-    // Matches Circle's startup64.S armv8_switch_to_el1_m macro.
-    "movz x8, #0x0800",
-    "movk x8, #0x30d0, lsl #16",
-    "msr sctlr_el1, x8",
-
-    // SP_EL1 = MEM_EXCEPTION_STACK = 0x308000
-    // In EL1t mode, exception/IRQ handlers use SP_EL1 (separate from
-    // the kernel stack SP_EL0). This is what Circle expects.
-    "movz x8, #0x8000",
-    "movk x8, #0x30, lsl #16",
-    "msr sp_el1, x8",
-
-    // VBAR_EL1 = Circle's VectorTable.
-    // Without this, any IRQ jumps to address 0 and the CPU dies.
-    // VectorTable is defined in Circle's exceptionstub64.S and exported
-    // from libcircle_nostartup.a.
-    "ldr x8, =VectorTable",
-    "msr vbar_el1, x8",
-    "isb",
-
-    // SPSR_EL2: EL1t (0b00100), DAIF all masked. 0x3C4 = 0b11_1100_0100
-    // EL1t means: normal code uses SP_EL0, exception handlers use SP_EL1.
-    // This matches Circle's startup64.S exactly.
-    "mov x8, #0x3c4",
-    "msr spsr_el2, x8",
-
-    // ELR_EL2: jump to EL1 entry after ERET.
-    "adr x8, .L_el1_entry",
-    "msr elr_el2, x8",
-    "eret",
-
-    // ── EL1 entry ────────────────────────────────────────────────────────────
-    ".L_el1_entry:",
-    // Kernel stack = MEM_KERNEL_STACK = 0x2A0000 (grows downward).
-    // In EL1t mode, `mov sp, x8` sets SP_EL0 (the thread stack pointer).
-    // Circle's startup64.S uses this same value.
+    // Set up EL2 stack pointer (SP_EL2 = 0x2A0000, grows downward).
+    // We use the same address as the old EL1 kernel stack — it's safe
+    // because Linux will get its own stack from its own image.
     "movz x8, #0x0000",
     "movk x8, #0x2a, lsl #16",   // x8 = 0x002A0000
     "mov sp, x8",
 
-    // Jump to Rust init.
+    // Set VBAR_EL2 to our minimal EL2 exception vector table.
+    "ldr x8, =_el2_vectors",
+    "msr vbar_el2, x8",
+    "isb",
+
+    // Jump to Rust init (we are now at EL2 with a valid stack).
     "b {rust_init}",
 
     // ── Park loop ────────────────────────────────────────────────────────────
@@ -164,17 +118,85 @@ global_asm!(
     rust_init = sym rust_init,
 );
 
+// ── Minimal EL2 exception vector table ──────────────────────────────────────
+//
+// AArch64 exception vector table must be 2KB-aligned.
+// Each entry is 128 bytes (32 instructions max).
+// We only need to handle unexpected exceptions — just panic and halt.
+global_asm!(
+    ".balign 2048",
+    "_el2_vectors:",
+
+    // Current EL with SP0 — Synchronous
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SP0 — IRQ
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SP0 — FIQ
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SP0 — SError
+    ".balign 128",
+    "b _el2_panic",
+
+    // Current EL with SPx — Synchronous
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SPx — IRQ
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SPx — FIQ
+    ".balign 128",
+    "b _el2_panic",
+    // Current EL with SPx — SError
+    ".balign 128",
+    "b _el2_panic",
+
+    // Lower EL AArch64 — Synchronous (from Linux EL1)
+    ".balign 128",
+    "b _el2_lower_sync",
+    // Lower EL AArch64 — IRQ
+    ".balign 128",
+    "b _el2_lower_irq",
+    // Lower EL AArch64 — FIQ
+    ".balign 128",
+    "b _el2_panic",
+    // Lower EL AArch64 — SError
+    ".balign 128",
+    "b _el2_panic",
+
+    // Lower EL AArch32 — (not used)
+    ".balign 128",
+    "b _el2_panic",
+    ".balign 128",
+    "b _el2_panic",
+    ".balign 128",
+    "b _el2_panic",
+    ".balign 128",
+    "b _el2_panic",
+
+    // ── EL2 panic handler ────────────────────────────────────────────────────
+    "_el2_panic:",
+    "wfe",
+    "b _el2_panic",
+
+    // ── Lower EL sync handler (HVC from Linux, or stage-2 fault) ────────────
+    "_el2_lower_sync:",
+    // For now, just ERET back to Linux (ignore HVC calls)
+    "eret",
+
+    // ── Lower EL IRQ handler (Linux IRQ routed to EL2 via HCR_EL2.IMO) ──────
+    "_el2_lower_irq:",
+    // For now, just ERET back to Linux (pass IRQ handling back)
+    "eret",
+);
+
 /// Zero the BSS section and call kernel_main.
 ///
 /// # Safety
-/// Called from assembly once the stack pointer is valid. Must not be
-/// inlined or the compiler may emit a prologue before SP is ready.
-///
-/// NOTE: We do NOT call C++ static constructors (.init_array) here.
-/// Circle's objects (CInterruptSystem, CTimer, CXHCIDevice) are
-/// declared as local variables inside circle_usb_init() in the shim,
-/// NOT as file-scope statics. This avoids constructors running at
-/// boot time before UART/framebuffer are ready, which would crash.
+/// Called from assembly once the EL2 stack pointer is valid.
+/// Must not be inlined or the compiler may emit a prologue before SP is ready.
 #[no_mangle]
 unsafe extern "C" fn rust_init() -> ! {
     // Zero the BSS section (static mut variables, zero-init globals).

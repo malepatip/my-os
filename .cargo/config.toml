@@ -2,4 +2,4 @@
 target = "aarch64-unknown-none-softfloat"
 
 [target.aarch64-unknown-none-softfloat]
-rustflags = ["-C", "link-arg=-Tsrc/linker.ld", "-C", "link-arg=--undefined=VectorTable"]
+rustflags = ["-C", "link-arg=-Tsrc/linker.ld"]
