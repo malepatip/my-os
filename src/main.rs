@@ -116,6 +116,8 @@ pub extern "C" fn kernel_main() -> ! {
     kprint!("[kernel] USB HID:     ");
     #[cfg(feature = "bsp_rpi4")]
     {
+        // Diagnostic: 10 rapid blinks = about to call circle_usb_init
+        gpio::blink(10, 50, 50);
         kprintln!("calling circle_usb_init...");
         let usb_ok = usb_hid::usb_init();
         if usb_ok {
