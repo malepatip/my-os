@@ -98,15 +98,10 @@ global_asm!(
     // Zero virtual timer offset so EL1 virtual time == physical time.
     "msr cntvoff_el2, xzr",
 
-    // CNTFRQ_EL0 = 54 MHz (writable from EL2 on Cortex-A72 / ARMv8).
-    // Circle's CTimer::SimpleMsDelay() reads CNTFRQ_EL0 to compute delays.
-    // If it is 0 (which it is when the bootloader doesn't set it), division
-    // by zero causes a synchronous exception that kills the CPU.
-    // 54000000 = 0x033E_D280
-    "movz x8, #0xd280",
-    "movk x8, #0x033e, lsl #16",
-    "msr cntfrq_el0, x8",
-    "isb",
+    // NOTE: CNTFRQ_EL0 is NOT writable from EL2 on this Pi 4 firmware.
+    // Writing it causes a synchronous exception (blank screen).
+    // Instead, we override CTimer::SimpleMsDelay/GetClockTicks in the
+    // C++ shim to use a hardcoded 54 MHz value.
 
     // Disable coprocessor traps to EL2.
     "mov x8, #0x33ff",
