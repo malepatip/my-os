@@ -142,6 +142,15 @@ global_asm!(
     "movz x11, #0x0000",
     "movk x11, #0x28, lsl #16",
     "mov sp, x11",
+    // Write alive marker to 0x00201000 so core 0 can detect core 1 woke up
+    // This is BEFORE the trampoline, so if we see 0xC0RE0001 but Linux never
+    // signals ready, we know the trampoline/ERET is the problem.
+    "movz x11, #0x0001",
+    "movk x11, #0xC001, lsl #16",  // x11 = 0xC0010001 (core 1 alive marker)
+    "movz x12, #0x1000",
+    "movk x12, #0x0020, lsl #16",  // x12 = 0x00201000
+    "str x11, [x12]",
+    "dsb sy",
     // Branch to the trampoline address
     "br x10",
 

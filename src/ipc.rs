@@ -25,12 +25,28 @@ pub fn poll_key() -> Option<u8> {
 pub fn wait_for_linux_ready() {
     let shm = SharedMem::get();
     let mut dots = 0u32;
+
+    // Check core 1 alive marker at 0x00201000
+    // Written by boot.rs park loop BEFORE branching to trampoline
+    let alive_ptr = 0x0020_1000usize as *const u32;
+
     while !shm.is_ready() {
-        // Spin with a small delay (~1ms using system counter)
         crate::gpio::delay_ms(100);
         dots += 1;
         if dots % 10 == 0 {
             crate::kprint!(".");
+        }
+        // After 3 seconds, print core 1 alive status
+        if dots == 30 {
+            let marker = unsafe { core::ptr::read_volatile(alive_ptr) };
+            if marker == 0xC001_0001 {
+                crate::kprintln!();
+                crate::kprintln!("[kernel] Core 1: woke up and reached trampoline (marker=0x{:08X})", marker);
+                crate::kprintln!("[kernel] Core 1: Linux ERET fired — waiting for hid_daemon...");
+            } else {
+                crate::kprintln!();
+                crate::kprintln!("[kernel] Core 1: DID NOT WAKE (marker=0x{:08X}) — spin table not working", marker);
+            }
         }
         if dots > 300 {
             // 30 seconds timeout
