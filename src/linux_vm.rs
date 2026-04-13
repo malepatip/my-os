@@ -385,7 +385,7 @@ pub unsafe fn launch_linux(dtb_addr: usize) -> ! {
 /// Patch the DTB at LINUX_DTB_ADDR to set the chosen node with:
 ///   linux,initrd-start = LINUX_INITRD_ADDR
 ///   linux,initrd-end   = LINUX_INITRD_ADDR + initrd_size
-///   bootargs = "console=ttyAMA0,115200 8250.nr_uarts=1 root=/dev/ram0 rw"
+///   bootargs = "console=tty1 console=ttyAMA0,115200 rdinit=/init panic=5"
 ///
 /// The FDT (Flattened Device Tree) format:
 ///   Header (40 bytes): magic, totalsize, off_dt_struct, off_dt_strings, ...
@@ -429,7 +429,11 @@ pub fn setup_dtb(initrd_size: usize) -> usize {
     const FDT_END:        u32 = 9;
 
     // Bootargs string (null-terminated, padded to 4 bytes)
-    let bootargs = b"console=ttyAMA0,115200 8250.nr_uarts=1 root=/dev/ram0 rw\0";
+    // console=tty1      — output to HDMI framebuffer (we can see this)
+    // console=ttyAMA0   — also output to UART for when serial is available
+    // rdinit=/init      — use initramfs directly (not old-style /dev/ram0)
+    // panic=5           — reboot after 5 s on panic so we can catch the msg
+    let bootargs = b"console=tty1 console=ttyAMA0,115200 rdinit=/init panic=5\0";
 
     // Find the end of the structure block (FDT_END token)
     let struct_start = unsafe { dtb.add(off_struct) };
