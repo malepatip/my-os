@@ -207,11 +207,15 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
 fn launch_linux_on_core1(dtb_addr: usize) {
     // Trampoline lives at 1MB — well above our kernel (~57KB) and below Linux (0x80000+)
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    // spin_cpu1 is a data label in boot.rs placed by .ltorg after the code.
-    // Its address is determined by the linker (NOT hardcoded to 0xE0).
-    // This matches the rpi4-osdev tutorial approach exactly.
-    extern "C" { static mut spin_cpu1: u64; }
-    let spin_cpu1_addr = unsafe { &raw mut spin_cpu1 as usize };
+    // The armstub8.S (at physical 0x0) parks cores 1-3 in a WFE loop reading
+    // from spin_cpu1 at physical 0xE0. This is confirmed from the armstub source:
+    //   .org 0xe0
+    //   spin_cpu1: .quad 0
+    // Core 1 does: ldr x4, [x5, x6, lsl #3] where x5=spin_cpu0=0xD8, x6=1
+    //   => reads from 0xD8 + 1*8 = 0xE0
+    // With MMU off (no caches), a plain write + dsb sy + sev is sufficient.
+    // dc civac with MMU off can fault or be ignored — do NOT use it.
+    const ARMSTUB_SPIN_CPU1: usize = 0xE0;  // physical address, armstub8.S .org 0xe0
 
     // HCR_EL2: RW=1 (AArch64 EL1), plus VM/SWIO/PTW/FMO/IMO/AMO
     let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | 1;
@@ -277,37 +281,21 @@ fn launch_linux_on_core1(dtb_addr: usize) {
         data.add(9).write_volatile(hcr_value);                         // byte 72
         data.add(10).write_volatile(spsr_value);                       // byte 80
 
-        // 3. Clean D-cache for the trampoline range so core 1 sees it,
-        //    then invalidate I-cache so core 1 fetches fresh instructions.
-        //    We flush 2 cache lines (64 bytes each) to cover 88 bytes of trampoline.
-        // dc civac = clean AND invalidate to point of coherency.
-        // This is required on Cortex-A72 because each core has its own L1
-        // data cache. cvac only cleans (writes back) but doesn't invalidate
-        // other cores' caches. civac does both, ensuring core 1 sees our writes.
-        core::arch::asm!(
-            "dc civac, {a0}",
-            "dc civac, {a1}",
-            "dsb sy",
-            "ic ialluis",
-            "dsb sy",
-            "isb",
-            a0 = in(reg) TRAMPOLINE_ADDR,
-            a1 = in(reg) TRAMPOLINE_ADDR + 64,
-        );
+        // 3. Memory barrier to ensure all trampoline writes are visible
+        //    before we wake core 1. MMU is off so no cache ops needed.
+        core::arch::asm!("dsb sy", "isb");
 
-        // 4. Write TRAMPOLINE_ADDR to our own spin_cpu1 symbol.
-        //    Core 1 is parked in boot.rs reading this address via adr+ldr.
-        //    Use dc civac to ensure core 1 sees the new value.
-        let spin = spin_cpu1_addr as *mut u64;
+        // 4. Write TRAMPOLINE_ADDR to armstub spin table at physical 0xE0.
+        //    The armstub parks core 1 in: wfe; ldr x4,[0xE0]; cbz x4,loop; br x4
+        //    With MMU off, plain write + dsb sy + sev is all that's needed.
+        let spin = ARMSTUB_SPIN_CPU1 as *mut u64;
         spin.write_volatile(TRAMPOLINE_ADDR as u64);
         core::arch::asm!(
-            "dc civac, {addr}",
             "dsb sy",
             "sev",
-            addr = in(reg) spin_cpu1_addr,
         );
 
-        crate::kprintln!("[kernel] Core 1: spin_cpu1@0x{:08X} written, SEV sent", spin_cpu1_addr);
+        crate::kprintln!("[kernel] Core 1: armstub 0xE0 written 0x{:08X}, SEV sent", TRAMPOLINE_ADDR);
     }
 }
 
