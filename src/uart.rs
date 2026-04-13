@@ -113,6 +113,16 @@ pub fn puts(s: &str) {
     }
 }
 
+/// Print a u32 value as 8 hex digits over UART (e.g. "0xFE340000").
+pub fn puts_hex(val: u32) {
+    puts("0x");
+    let digits = b"0123456789ABCDEF";
+    for i in (0..8u32).rev() {
+        let nibble = ((val >> (i * 4)) & 0xF) as usize;
+        putc(digits[nibble]);
+    }
+}
+
 /// Return the UART base address for display purposes.
 pub fn base_address() -> usize {
     UART_BASE

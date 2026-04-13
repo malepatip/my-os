@@ -401,27 +401,26 @@ fn send_cmd(cmd: u32, arg: u32) -> u32 {
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Initialize the EMMC2 controller and SD card.
-/// Returns true on success.
+/// Returns true on success. Prints diagnostic info to UART.
 pub fn sd_init() -> bool {
-    // ── Pi 4 Step -1: Power on SD card via VideoCore ──────────────────────────
-    // CRITICAL: Without this, EMMC2 clock is not running and reset never clears.
-    // Source: Circle emmc.cpp line 680, rpi_boot_emmc.c line 1306
+    use crate::uart;
+
+    uart::puts("[sd] pwr...");
     power_on_sd_card();
     sleep_ms(10);
+    uart::puts("ok\r\n");
 
-    // ── Pi 4 Step 0: Disable 1.8V supply ─────────────────────────────────────
-    // REQUIRED on Pi 4. Sets GPIO 132 = 0 via mailbox to ensure 3.3V operation.
-    // Source: Circle/addon/SDCard/emmc.cpp lines 541-549
+    uart::puts("[sd] 18v...");
     disable_18v_supply();
     sleep_ms(5);
+    uart::puts("ok\r\n");
 
-    // ── Step 1: Query actual EMMC2 clock (clock_id=12) ───────────────────────
+    uart::puts("[sd] clk...");
     let base_hz = get_emmc_clock_hz();
+    uart::puts_hex(base_hz);
+    uart::puts("\r\n");
 
-    // ── Step 2: Reset host controller ────────────────────────────────────────
-    // Circle: OR in the reset bit, do NOT overwrite the whole register.
-    // Wait for bits 26:24 (7<<24) to ALL clear, not just bit 24.
-    // Source: Circle/addon/SDCard/emmc.cpp lines 1440-1450
+    uart::puts("[sd] rst...");
     wr(EMMC_CONTROL2, 0);
     wr(EMMC_CONTROL0, 0);
     let c1 = rd(EMMC_CONTROL1) | C1_SRST_HC;
@@ -430,74 +429,110 @@ pub fn sd_init() -> bool {
     let limit = 100 * ITERS_PER_MS;
     let mut reset_ok = false;
     for _ in 0..limit {
-        // Wait for ALL reset bits (26:24) to clear, not just bit 24
         if rd(EMMC_CONTROL1) & (7 << 24) == 0 { reset_ok = true; break; }
         unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
-    if !reset_ok { return false; }
+    if !reset_ok {
+        uart::puts("FAIL(reset timeout) C1=");
+        uart::puts_hex(rd(EMMC_CONTROL1));
+        uart::puts("\r\n");
+        return false;
+    }
+    uart::puts("ok\r\n");
 
-    // ── Pi 4 Step 3: Enable SD Bus Power VDD1 at 3.3V ────────────────────────
-    // REQUIRED on Pi 4 BCM2711 EMMC2. Without this, no commands will work.
-    // Source: Circle/addon/SDCard/emmc.cpp lines 1449-1451
+    uart::puts("[sd] vdd1...");
     wr(EMMC_CONTROL0, rd(EMMC_CONTROL0) | C0_VDD1_3V3);
     sleep_ms(2);
+    uart::puts("ok\r\n");
 
-    // ── Step 4: Set timeout and identification clock (400 kHz) ────────────────
+    uart::puts("[sd] clkset...");
     wr(EMMC_CONTROL1, rd(EMMC_CONTROL1) | C1_TOUNIT_MAX);
     set_clock(base_hz, 400_000);
+    uart::puts("ok\r\n");
 
-    // ── Step 5: Enable interrupts ─────────────────────────────────────────────
+    uart::puts("[sd] irqen...");
     wr(EMMC_IRPT_EN,   0xFFFF_FFFF);
     wr(EMMC_IRPT_MASK, 0xFFFF_FFFF);
+    uart::puts("ok\r\n");
 
-    // ── Step 6: CMD0 — GO_IDLE_STATE ─────────────────────────────────────────
-    // CMD0 has no response. Clear any pending interrupts first, then send.
-    // Do NOT check the return value — timeout error is expected for CMD0.
+    uart::puts("[sd] cmd0...");
     wr(EMMC_INTERRUPT, 0xFFFF_FFFF);
     wr(EMMC_ARG1, 0);
     wr(EMMC_CMDTM, CMD0);
     sleep_ms(2);
-    wr(EMMC_INTERRUPT, 0xFFFF_FFFF); // clear any timeout from CMD0
+    wr(EMMC_INTERRUPT, 0xFFFF_FFFF);
+    uart::puts("ok\r\n");
 
-    // ── Step 7: CMD8 — SEND_IF_COND ──────────────────────────────────────────
+    uart::puts("[sd] cmd8...");
     let r8 = send_cmd(CMD8, 0x0000_01AA);
     let is_v2 = r8 == 0x0000_01AA;
+    uart::puts_hex(r8);
+    uart::puts(if is_v2 { " v2\r\n" } else { " v1\r\n" });
 
-    // ── Step 8: ACMD41 — SD_SEND_OP_COND ─────────────────────────────────────
+    uart::puts("[sd] acmd41...");
     let acmd_arg = if is_v2 { 0x51FF_8000u32 } else { 0x00FF_8000u32 };
     let mut resp: u32 = 0;
     let mut card_ready = false;
     for _ in 0..50u32 {
         resp = send_cmd(ACMD41, acmd_arg);
-        if resp == 0xFFFF_FFFF { return false; }
+        if resp == 0xFFFF_FFFF {
+            uart::puts("FAIL(cmd55/acmd41 err)\r\n");
+            return false;
+        }
         if resp & 0x8000_0000 != 0 {
             card_ready = true;
             break;
         }
+        uart::puts(".");
         sleep_ms(5);
     }
-    if !card_ready { return false; }
+    if !card_ready {
+        uart::puts("FAIL(not ready) resp=");
+        uart::puts_hex(resp);
+        uart::puts("\r\n");
+        return false;
+    }
     unsafe { SD_HCCS = resp & 0x4000_0000 != 0; }
+    uart::puts(if unsafe { SD_HCCS } { "ok SDHC\r\n" } else { "ok SDSC\r\n" });
 
-    // ── Step 9: CMD2 — ALL_SEND_CID ──────────────────────────────────────────
-    if send_cmd(CMD2, 0) == 0xFFFF_FFFF { return false; }
+    uart::puts("[sd] cmd2...");
+    if send_cmd(CMD2, 0) == 0xFFFF_FFFF {
+        uart::puts("FAIL\r\n");
+        return false;
+    }
+    uart::puts("ok\r\n");
 
-    // ── Step 10: CMD3 — SEND_RELATIVE_ADDR ───────────────────────────────────
+    uart::puts("[sd] cmd3...");
     let r3 = send_cmd(CMD3, 0);
-    if r3 == 0xFFFF_FFFF { return false; }
+    if r3 == 0xFFFF_FFFF {
+        uart::puts("FAIL\r\n");
+        return false;
+    }
     unsafe { SD_RCA = r3 >> 16; }
+    uart::puts("rca=");
+    uart::puts_hex(unsafe { SD_RCA });
+    uart::puts("\r\n");
 
-    // ── Step 11: Raise clock to 25 MHz ───────────────────────────────────────
+    uart::puts("[sd] clk25...");
     set_clock(base_hz, 25_000_000);
+    uart::puts("ok\r\n");
 
-    // ── Step 12: CMD7 — SELECT_CARD ──────────────────────────────────────────
+    uart::puts("[sd] cmd7...");
     let rca = unsafe { SD_RCA };
-    if send_cmd(CMD7, rca << 16) == 0xFFFF_FFFF { return false; }
+    if send_cmd(CMD7, rca << 16) == 0xFFFF_FFFF {
+        uart::puts("FAIL\r\n");
+        return false;
+    }
+    uart::puts("ok\r\n");
 
-    // ── Step 13: CMD16 — SET_BLOCKLEN = 512 (SDSC only) ──────────────────────
     if !unsafe { SD_HCCS } {
+        uart::puts("[sd] cmd16...");
         let r16 = send_cmd(CMD16, 512);
-        if r16 & 0xFFFF_0000 != 0 { return false; }
+        if r16 & 0xFFFF_0000 != 0 {
+            uart::puts("FAIL\r\n");
+            return false;
+        }
+        uart::puts("ok\r\n");
     }
 
     true
