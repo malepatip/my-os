@@ -1,5 +1,5 @@
 /* Linker script for AArch64 bare-metal kernel on Raspberry Pi 4 */
-/* ai-os v0.4.0 — EL2 Thin Hypervisor */
+/* ai-os v0.5.0 — EL2 Thin Hypervisor */
 /* The RPi firmware loads the kernel at 0x80000 */
 
 ENTRY(_start)

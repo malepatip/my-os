@@ -277,9 +277,13 @@ fn launch_linux_on_core1(dtb_addr: usize) {
         // 3. Clean D-cache for the trampoline range so core 1 sees it,
         //    then invalidate I-cache so core 1 fetches fresh instructions.
         //    We flush 2 cache lines (64 bytes each) to cover 88 bytes of trampoline.
+        // dc civac = clean AND invalidate to point of coherency.
+        // This is required on Cortex-A72 because each core has its own L1
+        // data cache. cvac only cleans (writes back) but doesn't invalidate
+        // other cores' caches. civac does both, ensuring core 1 sees our writes.
         core::arch::asm!(
-            "dc cvac, {a0}",
-            "dc cvac, {a1}",
+            "dc civac, {a0}",
+            "dc civac, {a1}",
             "dsb sy",
             "ic ialluis",
             "dsb sy",
@@ -289,12 +293,12 @@ fn launch_linux_on_core1(dtb_addr: usize) {
         );
 
         // 4. Write TRAMPOLINE_ADDR to the armstub spin table entry for core 1.
-        //    This is physical address 0xE0 (spin_cpu1 in armstub8.S).
-        //    CRITICAL: flush this cache line too so core 1's WFE/LDR sees it.
+        //    Physical address 0xE0 (spin_cpu1 in armstub8.S).
+        //    Use dc civac to ensure core 1 sees the new value.
         let spin = SPIN_CPU1 as *mut u64;
         spin.write_volatile(TRAMPOLINE_ADDR as u64);
         core::arch::asm!(
-            "dc cvac, {addr}",
+            "dc civac, {addr}",
             "dsb sy",
             "sev",
             addr = in(reg) SPIN_CPU1,
