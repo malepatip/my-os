@@ -76,7 +76,7 @@ pub extern "C" fn kernel_main() -> ! {
     kprintln!("");
     kprintln!("[kernel] UART:        OK @ 0x{:08X}", uart::base_address());
     if fb_ok {
-        kprintln!("[kernel] Framebuffer: OK (1920x1080 @ 32bpp)");
+        kprintln!("[kernel] Framebuffer: OK (1280x720 @ 32bpp)");
     } else {
         kprintln!("[kernel] Framebuffer: FAILED -- UART-only mode");
     }
