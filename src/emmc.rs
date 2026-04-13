@@ -52,9 +52,11 @@ const CMD_NEED_APP:  u32 = 0x8000_0000;
 const CMD_RSPNS_48:  u32 = 0x0002_0000;
 const CMD_RSPNS_48B: u32 = 0x0003_0000;
 const CMD_RSPNS_136: u32 = 0x0001_0000;
-const CMD_DATA_READ: u32 = 0x0010_0000;
-const CMD_IXCHK_EN:  u32 = 0x0010_0000;
-const CMD_CRCCHK_EN: u32 = 0x0008_0000;
+const CMD_DATA_EN:   u32 = 0x0000_0020;  // bit 5: data present
+const CMD_DATA_READ: u32 = 0x0000_0010;  // bit 4: data direction = read
+const CMD_BLKCNT_EN: u32 = 0x0000_0002;  // bit 1: block count enable
+const CMD_IXCHK_EN:  u32 = 0x0010_0000;  // bit 20: index check enable
+const CMD_CRCCHK_EN: u32 = 0x0008_0000;  // bit 19: CRC check enable
 
 // ─── STATUS bits ─────────────────────────────────────────────────────────────
 const SR_DAT_INHIBIT:    u32 = 0x0000_0002;
@@ -81,8 +83,9 @@ const CMD7:   u32 = 0x0700_0000 | CMD_RSPNS_48B;
 const CMD8:   u32 = 0x0800_0000 | CMD_RSPNS_48;
 const CMD16:  u32 = 0x1000_0000 | CMD_RSPNS_48;
 const CMD17:  u32 = 0x1100_0000 | CMD_RSPNS_48
-                  | CMD_DATA_READ | CMD_IXCHK_EN | CMD_CRCCHK_EN;
-const CMD55:  u32 = 0x3700_0000 | CMD_RSPNS_48;
+                  | CMD_IXCHK_EN | CMD_CRCCHK_EN
+                  | CMD_DATA_EN  | CMD_DATA_READ | CMD_BLKCNT_EN;
+const CMD55:  u32 = 0x3700_0000;  // no response bits — added conditionally in send_cmd
 const ACMD41: u32 = CMD_NEED_APP | 0x2900_0000 | CMD_RSPNS_48;
 
 // ─── Timing constants ─────────────────────────────────────────────────────────
@@ -235,11 +238,13 @@ fn set_clock(base_hz: u32, target_hz: u32) {
 fn send_cmd(cmd: u32, arg: u32) -> u32 {
     if cmd & CMD_NEED_APP != 0 {
         let rca = unsafe { SD_RCA };
-        let r = send_cmd(CMD55, rca << 16);
+        // CMD55: add CMD_RSPNS_48 only when we have an RCA (card is in data-transfer state)
+        let cmd55 = if rca != 0 { CMD55 | CMD_RSPNS_48 } else { CMD55 };
+        let r = send_cmd(cmd55, rca << 16);
         if r == 0xFFFF_FFFF { return 0xFFFF_FFFF; }
-        if rd(EMMC_STATUS) & SR_APP_CMD == 0 { return 0xFFFF_FFFF; }
+        // Only check APP_CMD bit if we sent with response
+        if rca != 0 && rd(EMMC_STATUS) & SR_APP_CMD == 0 { return 0xFFFF_FFFF; }
     }
-
     let cmdtm = cmd & !CMD_NEED_APP;
 
     if !wait_cmd_idle() { return 0xFFFF_FFFF; }
