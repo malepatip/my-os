@@ -51,7 +51,7 @@ flash: build-pi4
 	@python3 -c "\
 import os; \
 src='sdcard'; dst='$(SD_BOOT)'; \
-files=['config.txt','start4.elf','fixup4.dat','bcm2711-rpi-4-b.dtb','kernel8.img']; \
+files=['config.txt','start4.elf','fixup4.dat','bcm2711-rpi-4-b.dtb','kernel8.img','bl31.bin']; \
 [( \
   d:=open(os.path.join(dst,f),'wb'), \
   d.write(open(os.path.join(src,f),'rb').read()), \

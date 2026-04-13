@@ -1,8 +1,15 @@
-# config.txt — my-ai-os v0.5.1
+# config.txt — my-ai-os v0.6.0
 # Raspberry Pi 4 Model B
-# Kernel loads at 0x80000 (default). All 4 cores start at 0x80000.
-# Cores 1-3 park in boot.rs spin loop. Core 0 runs kernel_main.
-
+#
+# Boot flow with TF-A:
+#   GPU firmware loads bl31.bin (TF-A BL31) at EL3
+#   TF-A patches DTB to advertise PSCI (method=smc)
+#   TF-A drops Core 0 into EL2 at 0x80000 (our hypervisor)
+#   TF-A parks Cores 1-3 in its own secondary spin loop
+#   Linux calls CPU_ON SMC -> TF-A wakes Cores 1-3 at EL1
+#   Result: all 4 cores enter Linux at EL1 (no mode mismatch)
+#
+armstub=bl31.bin
 arm_64bit=1
 kernel=kernel8.img
 enable_uart=1

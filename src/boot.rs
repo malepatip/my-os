@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: MIT
 //
-// boot.rs — AArch64 bare-metal boot code for ai-os v0.5.1
+// boot.rs — AArch64 bare-metal boot code for ai-os v0.6.0
 //
-// APPROACH: Mirrors the proven rpi4-osdev part10-multicore tutorial exactly.
+// BOOT FLOW WITH TF-A (feature/tfa-psci):
 //
-// Kernel loads at 0x80000 (default, no kernel_old=1).
-// All 4 cores start executing at 0x80000 simultaneously.
-// Cores 1-3 park in a WFE loop reading from spin_cpu[N] (data labels in binary).
-// Core 0 sets up EL2 and calls rust_init().
+//   GPU firmware loads bl31.bin (TF-A BL31) at EL3.
+//   TF-A runs at EL3, initialises GIC, patches DTB to add PSCI node
+//   (method = "smc"), then drops Core 0 into EL2 at 0x80000 (here).
+//   Cores 1-3 are parked by TF-A in its own secondary spin loop at EL3.
+//   They are NOT released to EL2 until Linux calls CPU_ON via PSCI SMC.
+//   TF-A intercepts CPU_ON, wakes each secondary core, and drops it
+//   directly into Linux at EL1 — so all 4 cores arrive at Linux in EL1.
 //
-// To wake core 1:
-//   extern "C" { static spin_cpu1: u64; }
-//   (spin_cpu1 as *mut u64).write_volatile(entry_addr);
-//   asm!("sev");
+// WHAT THIS FILE DOES:
+//   Core 0 enters here at EL2 (TF-A guarantees this).
+//   Core 0 sets up EL2 system registers and calls rust_init().
+//   Cores 1-3 NEVER reach this file — TF-A handles them entirely.
 //
-// The spin table labels (spin_cpu0..3) are placed by .ltorg after the code.
-// Their addresses are determined by the linker — NOT hardcoded.
+// NOTE: The EL3 -> EL2 fallback path (.L_from_el3) is kept as a safety
+//   net in case someone boots without bl31.bin (e.g. during development
+//   with the old armstub). It will not be hit in normal TF-A operation.
 
 use core::arch::global_asm;
 
@@ -24,76 +28,50 @@ global_asm!(
     ".global _start",
     "_start:",
 
-    // ── Timer setup (matches rpi4-osdev tutorial) ────────────────────────────
-    // LOCAL_CONTROL = 0xFF800000: clear to use crystal clock
+    // ── Timer setup ──────────────────────────────────────────────────────────
+    // LOCAL_CONTROL @ 0xFF800000: clear to use 19.2 MHz crystal clock
     "ldr x0, =0xFF800000",
     "str wzr, [x0]",
-    // LOCAL_PRESCALER = 0xFF800008: set to 0x80000000 for 1:1 prescale
+    // LOCAL_PRESCALER @ 0xFF800008: divide-by-1 (0x80000000)
     "mov w1, #0x80000000",
     "str w1, [x0, #8]",
-    // CNTFRQ_EL0 = 54 MHz (only writable at EL3 or if we're at EL2 with access)
-    // On Pi 4 with start4.elf, we're at EL2 and CNTFRQ is already set.
-    // Try to set it; if it faults, the exception handler will ignore it.
-    "ldr x0, =54000000",
-    "msr cntfrq_el0, x0",
+    // CNTVOFF_EL2: zero the virtual timer offset
     "msr cntvoff_el2, xzr",
 
     // ── Core ID check ────────────────────────────────────────────────────────
-    // Read MPIDR_EL1 bits [1:0] to get core ID (0-3)
+    // With TF-A, only Core 0 reaches this point.
+    // Cores 1-3 are parked by TF-A and never execute this code.
+    // We still check the core ID defensively — if somehow a secondary core
+    // arrives here (e.g. without TF-A), it parks in a safe WFE loop.
     "mrs x1, mpidr_el1",
     "and x1, x1, #3",
-    // Core 0 continues; cores 1-3 go to park loop
     "cbz x1, .L_core0",
 
-    // ── Park loop (cores 1-3) ────────────────────────────────────────────────
-    // x1 = core_id (1, 2, or 3)
-    // x5 = address of spin_cpu0 (PC-relative via adr)
-    "adr x5, spin_cpu0",
-    ".L_park_loop:",
+    // ── Safety park for unexpected secondary cores ────────────────────────────
+    // This should never execute with TF-A. If it does, something is wrong.
+    ".L_secondary_park:",
     "wfe",
-    "ldr x4, [x5, x1, lsl #3]",  // x4 = spin_cpu[core_id]
-    "cbz x4, .L_park_loop",       // if zero, keep waiting
-    // Non-zero: set up minimal EL2 state for this core
-    // Set up stack: __stack_start + core_id * 512
-    "ldr x2, =__stack_start",
-    "lsl x3, x1, #9",             // core_id * 512
-    "add x3, x2, x3",
-    "mov sp, x3",
-    // Write alive marker to 0x00201000 (core 1 only, for diagnostics)
-    "cmp x1, #1",
-    "b.ne .L_no_marker",
-    "movz x6, #0x0001",
-    "movk x6, #0xC001, lsl #16",  // 0xC0010001
-    "movz x7, #0x1000",
-    "movk x7, #0x0020, lsl #16",  // 0x00201000
-    "str x6, [x7]",
-    "dsb sy",
-    ".L_no_marker:",
-    // Clear x0-x3 per Linux boot ABI (x0=DTB will be set by trampoline)
-    "mov x0, #0",
-    "mov x2, #0",
-    "mov x3, #0",
-    // Branch to entry function
-    "br x4",
-    "b .L_park_loop",             // safety: loop if br returns
+    "b .L_secondary_park",
 
-    // ── Core 0 setup ─────────────────────────────────────────────────────────
+    // ── Core 0 entry ─────────────────────────────────────────────────────────
     ".L_core0:",
-    // Detect exception level
+    // Detect current exception level
     "mrs x9, CurrentEL",
     "lsr x9, x9, #2",
     "cmp x9, #3",
     "b.eq .L_from_el3",
     "cmp x9, #2",
     "b.eq .L_from_el2",
-    "b .L_park_loop",             // EL1 — shouldn't happen
+    // EL1 — should never happen; park safely
+    "b .L_secondary_park",
 
-    // ── EL3 → EL2 ───────────────────────────────────────────────────────────
+    // ── EL3 → EL2 fallback (only without TF-A) ───────────────────────────────
+    // With TF-A this path is never taken. Kept for development fallback only.
     ".L_from_el3:",
     "mov x8, xzr",
-    "orr x8, x8, #(1 << 0)",     // SCR_EL3.NS
-    "orr x8, x8, #(1 << 8)",     // SCR_EL3.HCE
-    "orr x8, x8, #(1 << 10)",    // SCR_EL3.RW (EL2 is AArch64)
+    "orr x8, x8, #(1 << 0)",     // SCR_EL3.NS  — non-secure world
+    "orr x8, x8, #(1 << 8)",     // SCR_EL3.HCE — HVC instructions enabled
+    "orr x8, x8, #(1 << 10)",    // SCR_EL3.RW  — EL2 is AArch64
     "msr scr_el3, x8",
     "mov x8, #0x3c9",             // SPSR_EL3: EL2h, DAIF masked
     "msr spsr_el3, x8",
@@ -101,67 +79,79 @@ global_asm!(
     "msr elr_el3, x8",
     "eret",
 
-    // ── EL2 setup (core 0) ──────────────────────────────────────────────────
+    // ── EL2 setup (Core 0, normal TF-A entry point) ──────────────────────────
     ".L_from_el2:",
-    "mov x8, #(1 << 31)",         // HCR_EL2.RW = 1 (EL1 is AArch64)
+    // HCR_EL2: RW=1 (EL1 is AArch64). VM, trap bits set later in linux_vm.rs.
+    "mov x8, #(1 << 31)",
     "msr hcr_el2, x8",
     "isb",
+
+    // Counter access: allow EL1 to access physical counter and timer
     "mrs x8, cnthctl_el2",
     "orr x8, x8, #0x3",           // EL1PCTEN | EL1PCEN
     "msr cnthctl_el2, x8",
     "msr cntvoff_el2, xzr",
+
+    // Coprocessor traps: disable all to avoid spurious traps from Linux
     "mov x8, #0x33ff",
-    "msr cptr_el2, x8",           // disable coprocessor traps
+    "msr cptr_el2, x8",
     "msr hstr_el2, xzr",
-    // Core 0 stack at 0x00400000 (4MB, well above kernel)
+
+    // Core 0 stack at 0x00400000 (4MB mark, well above kernel)
     "mov sp, #0x400000",
-    // VBAR_EL2
+
+    // Install EL2 exception vector table
     "ldr x8, =_el2_vectors",
     "msr vbar_el2, x8",
     "isb",
-    "b {rust_init}",
 
-    // ── Spin table data (placed by .ltorg) ───────────────────────────────────
-    // These labels are the spin table. Their addresses are used by
-    // launch_linux_on_core1() to wake core 1.
-    ".ltorg",
-    ".global spin_cpu0",
-    "spin_cpu0: .quad 0",         // core 0 (unused)
-    ".global spin_cpu1",
-    "spin_cpu1: .quad 0",         // core 1 — written to wake Linux VM
-    ".global spin_cpu2",
-    "spin_cpu2: .quad 0",         // core 2 (unused)
-    ".global spin_cpu3",
-    "spin_cpu3: .quad 0",         // core 3 (unused)
+    // Jump to Rust init (zeroes BSS, calls kernel_main)
+    "b {rust_init}",
 
     rust_init = sym rust_init,
 );
 
 // ── EL2 exception vector table ───────────────────────────────────────────────
+//
+// With TF-A handling PSCI, the only EL2 exceptions we expect during normal
+// operation are:
+//   - Lower EL sync: stage-2 faults from Linux (handled by linux_vm.rs later)
+//   - Lower EL IRQ:  interrupts from Linux guests (routed via GIC)
+//
+// For now all entries panic — we will add real handlers incrementally.
 global_asm!(
     ".balign 2048",
     "_el2_vectors:",
+    // Current EL with SP0
+    ".balign 128", "b _el2_panic",   // Sync
+    ".balign 128", "b _el2_panic",   // IRQ
+    ".balign 128", "b _el2_panic",   // FIQ
+    ".balign 128", "b _el2_panic",   // SError
+    // Current EL with SPx
+    ".balign 128", "b _el2_panic",   // Sync
+    ".balign 128", "b _el2_panic",   // IRQ
+    ".balign 128", "b _el2_panic",   // FIQ
+    ".balign 128", "b _el2_panic",   // SError
+    // Lower EL AArch64
+    ".balign 128", "b _el2_lower_sync",  // Sync  (stage-2 faults, HVC/SMC from EL1)
+    ".balign 128", "b _el2_lower_irq",   // IRQ
+    ".balign 128", "b _el2_panic",       // FIQ
+    ".balign 128", "b _el2_panic",       // SError
+    // Lower EL AArch32
     ".balign 128", "b _el2_panic",
     ".balign 128", "b _el2_panic",
     ".balign 128", "b _el2_panic",
     ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_lower_sync",
-    ".balign 128", "b _el2_lower_irq",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
-    ".balign 128", "b _el2_panic",
+
     "_el2_panic:",
     "wfe",
     "b _el2_panic",
+
+    // Lower EL sync: for now just ERET back — Linux will handle its own faults.
+    // A real implementation would inspect ESR_EL2 and handle stage-2 faults.
     "_el2_lower_sync:",
     "eret",
+
     "_el2_lower_irq:",
     "eret",
 );

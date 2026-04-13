@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: MIT
 //
-// main.rs — ai-os v0.4.0 — EL2 Thin Hypervisor + Linux Driver VM
+// main.rs — ai-os v0.6.0 — EL2 Thin Hypervisor + Linux Driver VM (TF-A boot)
 //
 // Architecture:
-//   ai-os Rust kernel runs at EL2 (boots first, stays at EL2)
-//   Linux driver VM runs at EL1 on core 1 (handles USB/PCIe hardware)
+//   TF-A (bl31.bin) runs at EL3, handles PSCI, patches DTB
+//   ai-os Rust kernel runs at EL2 (Core 0 only, dropped here by TF-A)
+//   Linux driver VM runs at EL1 on all 4 cores (TF-A handles secondary cores)
 //   Shared memory ring buffer at 0x0020_0000 for USB HID IPC
 //
 // Boot sequence:
-//   1. boot.rs (assembly) → parks cores 1-3, stays at EL2, zeros BSS
-//   2. kernel_main() → GPIO LED, UART, Framebuffer, boot banner
-//   3. kernel_main() → load Linux kernel + initramfs + DTB from SD card
-//   4. kernel_main() → set up stage-2 identity page tables
-//   5. kernel_main() → release core 1 to run Linux at EL1
-//   6. kernel_main() → wait for Linux to signal USB HID ready
-//   7. kernel_main() → enter ai-os> shell (reads from shared memory)
+//   1. TF-A (EL3) → patches DTB (adds psci node), drops Core 0 to EL2 at 0x80000
+//   2. boot.rs (EL2 assembly) → zeros BSS, calls kernel_main()
+//   3. kernel_main() → GPIO LED, UART, Framebuffer, boot banner
+//   4. kernel_main() → load Linux kernel + initramfs + DTB from SD card
+//   5. kernel_main() → set up stage-2 identity page tables
+//   6. kernel_main() → ERET Core 0 into Linux at EL1
+//   7. Linux boots, calls CPU_ON SMC for Cores 1-3
+//   8. TF-A intercepts CPU_ON → drops Cores 1-3 to Linux at EL1
+//   9. Linux SMP: all 4 cores at EL1, no mode mismatch
 //
 // Shell commands: help, info, elinfo, memmap, usbstatus, echo, clear, halt
 
@@ -66,8 +69,8 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── Step 2: Boot banner ───────────────────────────────────────────────
     kprintln!("========================================");
-    kprintln!("  ai-os v0.4.0");
-    kprintln!("  EL2 Hypervisor + Linux Driver VM");
+    kprintln!("  ai-os v0.6.0");
+    kprintln!("  EL2 Hypervisor + Linux Driver VM (TF-A)");
     kprintln!("  Board: Raspberry Pi 4 (BCM2711)");
     kprintln!("========================================");
     kprintln!("");
@@ -151,21 +154,21 @@ pub extern "C" fn kernel_main() -> ! {
     linux_vm::setup_stage2_tables();
     kprintln!("OK (4GB identity map)");
 
-    // ── Step 6: Launch Linux on core 1 ───────────────────────────────────
-    kprintln!("[kernel] Launching Linux driver VM on core 1...");
-    launch_linux_on_core1(linux_vm::LINUX_DTB_ADDR);
-    kprintln!("[kernel] Linux VM launched (core 1 released)");
-
-    // ── Step 7: Wait for Linux USB HID daemon to be ready ────────────────
-    kprint!("[kernel] USB HID:     waiting for Linux");
-    ipc::wait_for_linux_ready();
-
+    // ── Step 6: ERET Core 0 into Linux at EL1 ───────────────────────────────
+    // With TF-A, Core 0 is at EL2. We ERET directly into Linux at EL1.
+    // TF-A will handle CPU_ON SMC calls from Linux to wake Cores 1-3.
+    // This call does NOT return — execution continues inside Linux.
+    kprintln!("[kernel] Entering Linux at EL1 (Core 0)...");
+    kprintln!("[kernel] TF-A will handle secondary core bring-up via PSCI.");
+    unsafe { linux_vm::launch_linux(linux_vm::LINUX_DTB_ADDR); }
+    // NOTE: launch_linux() does not return (it ERETSs into Linux).
+    // The shell below is unreachable in normal TF-A operation.
+    // It is retained so the function signature compiles as -> !.
+    // If Linux somehow returns (it should not), we fall through to shell.
     kprintln!("");
-    kprintln!("[kernel] Entering ai-os shell...");
-    kprintln!("Type 'help' for available commands.");
+    kprintln!("[kernel] WARNING: Linux returned unexpectedly.");
+    kprintln!("[kernel] Entering fallback shell...");
     kprintln!("");
-
-    // ── Step 8: Shell ─────────────────────────────────────────────────────
     shell();
 }
 
@@ -182,121 +185,6 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
         offset += len;
     });
     if found { offset } else { 0 }
-}
-
-/// Release core 1 to run Linux at EL1 using the official armstub8.S spin table.
-///
-/// The Pi 4 start4.elf firmware embeds armstub8.S at physical address 0x0.
-/// That stub parks cores 1-3 in a WFE loop reading from:
-///   Core 1: physical 0xE0  (spin_cpu1)
-///   Core 2: physical 0xE8  (spin_cpu2)
-///   Core 3: physical 0xF0  (spin_cpu3)
-///
-/// The stub's secondary_spin loop is:
-///   adr x5, spin_cpu0       // x5 = 0xD8
-///   wfe
-///   ldr x4, [x5, x6, lsl #3]  // x4 = *(0xD8 + core_id*8)
-///   cbz x4, secondary_spin
-///   mov x0, #0
-///   b boot_kernel           // br x4 with x0=0, x1=x2=x3=0
-///
-/// So we write TRAMPOLINE_ADDR to 0xE0, flush the D-cache line covering
-/// 0xE0 (so core 1 sees the new value), then send SEV to wake it.
-/// Core 1 will jump to our trampoline at EL2 with x0=0.
-/// The trampoline sets HCR_EL2, SPSR_EL2, ELR_EL2 and ERETSs to Linux at EL1.
-fn launch_linux_on_core1(dtb_addr: usize) {
-    // Trampoline lives at 1MB — well above our kernel (~57KB) and below Linux (0x80000+)
-    const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    // The armstub8.S (at physical 0x0) parks cores 1-3 in a WFE loop reading
-    // from spin_cpu1 at physical 0xE0. This is confirmed from the armstub source:
-    //   .org 0xe0
-    //   spin_cpu1: .quad 0
-    // Core 1 does: ldr x4, [x5, x6, lsl #3] where x5=spin_cpu0=0xD8, x6=1
-    //   => reads from 0xD8 + 1*8 = 0xE0
-    // With MMU off (no caches), a plain write + dsb sy + sev is sufficient.
-    // dc civac with MMU off can fault or be ignored — do NOT use it.
-    const ARMSTUB_SPIN_CPU1: usize = 0xE0;  // physical address, armstub8.S .org 0xe0
-
-    // HCR_EL2: RW=1 (AArch64 EL1), plus VM/SWIO/PTW/FMO/IMO/AMO
-    let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | 1;
-    // SPSR_EL2: EL1h (0x5), DAIF all masked (bits 9:6 = 0b1111 = 0x3C0) => 0x3C5
-    let spsr_value: u64 = 0x3C5;
-
-    // ── Trampoline layout at TRAMPOLINE_ADDR ─────────────────────────────────
-    // The armstub delivers core 1 here at EL2 with x0=0, x1=x2=x3=0.
-    // We must set up HCR_EL2/SPSR_EL2/ELR_EL2 then ERET to Linux at EL1.
-    //
-    // Byte offsets:
-    //   [0..51]  13 x u32 instructions
-    //   [52]     nop (pad to 8-byte align)
-    //   [56]     dtb_addr    (u64)  — LDR PC-relative offset from instr[0]
-    //   [64]     linux_entry (u64)
-    //   [72]     hcr_value   (u64)
-    //   [80]     spsr_value  (u64)
-    //
-    // LDR literal encoding: 0x58000000 | (imm19 << 5) | Rt
-    //   imm19 = (data_byte_offset - instr_byte_offset) / 4
-    //   instr[0] @ byte 0,  data @ byte 56: imm19 = 56/4 = 14 → 0x580001C9 (x9)
-    //   instr[1] @ byte 4,  data @ byte 64: imm19 = 60/4 = 15 → 0x580001EA (x10)
-    //   instr[2] @ byte 8,  data @ byte 72: imm19 = 64/4 = 16 → 0x5800020B (x11)
-    //   instr[3] @ byte 12, data @ byte 80: imm19 = 68/4 = 17 → 0x5800022C (x12)
-    //
-    // MSR encodings (from ARM ARM, confirmed correct):
-    //   msr spsr_el2, x12 = 0xD51C400C
-    //   msr elr_el2,  x10 = 0xD51C402A
-    //   msr hcr_el2,  x11 = 0xD5110C0B  ← S3_4_C1_C1_0
-    //
-    // mov x0, x9  = 0xAA0903E0
-    // mov x1, xzr = 0xAA1F03E1  (Linux boot protocol: x1=x2=x3=0)
-    // mov x2, xzr = 0xAA1F03E2
-    // mov x3, xzr = 0xAA1F03E3
-    let trampoline_code: [u32; 13] = [
-        0x580001C9u32, // [0]  ldr x9,  [pc, #56]  ; dtb_addr
-        0x580001EAu32, // [4]  ldr x10, [pc, #60]  ; linux_entry
-        0x5800020Bu32, // [8]  ldr x11, [pc, #64]  ; hcr_value
-        0x5800022Cu32, // [12] ldr x12, [pc, #68]  ; spsr_value
-        0xAA0903E0u32, // [16] mov x0, x9          ; x0 = dtb_addr (Linux ABI)
-        0xAA1F03E1u32, // [20] mov x1, xzr
-        0xAA1F03E2u32, // [24] mov x2, xzr
-        0xAA1F03E3u32, // [28] mov x3, xzr
-        0xD51C400Cu32, // [32] msr spsr_el2, x12
-        0xD51C402Au32, // [36] msr elr_el2,  x10
-        0xD51C110Bu32, // [40] msr hcr_el2,  x11  (S3_4_C1_C1_0 = 0xD51C110B)
-        0xD5033FDFu32, // [44] isb
-        0xD69F03E0u32, // [48] eret
-    ];
-
-    unsafe {
-        // 1. Write trampoline instructions to TRAMPOLINE_ADDR
-        let t = TRAMPOLINE_ADDR as *mut u32;
-        for (i, &word) in trampoline_code.iter().enumerate() {
-            t.add(i).write_volatile(word);
-        }
-        t.add(13).write_volatile(0xD503201Fu32); // nop padding at byte 52
-
-        // 2. Write data literals (u64 array, base = TRAMPOLINE_ADDR)
-        let data = TRAMPOLINE_ADDR as *mut u64;
-        data.add(7).write_volatile(dtb_addr as u64);                   // byte 56
-        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64); // byte 64
-        data.add(9).write_volatile(hcr_value);                         // byte 72
-        data.add(10).write_volatile(spsr_value);                       // byte 80
-
-        // 3. Memory barrier to ensure all trampoline writes are visible
-        //    before we wake core 1. MMU is off so no cache ops needed.
-        core::arch::asm!("dsb sy", "isb");
-
-        // 4. Write TRAMPOLINE_ADDR to armstub spin table at physical 0xE0.
-        //    The armstub parks core 1 in: wfe; ldr x4,[0xE0]; cbz x4,loop; br x4
-        //    With MMU off, plain write + dsb sy + sev is all that's needed.
-        let spin = ARMSTUB_SPIN_CPU1 as *mut u64;
-        spin.write_volatile(TRAMPOLINE_ADDR as u64);
-        core::arch::asm!(
-            "dsb sy",
-            "sev",
-        );
-
-        crate::kprintln!("[kernel] Core 1: armstub 0xE0 written 0x{:08X}, SEV sent", TRAMPOLINE_ADDR);
-    }
 }
 
 /// Shell with USB HID input via shared memory IPC + UART fallback.
