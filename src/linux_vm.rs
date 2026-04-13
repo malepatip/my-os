@@ -329,10 +329,16 @@ pub unsafe fn launch_linux(dtb_addr: usize) -> ! {
     // deactivating the GIC interrupt, Linux immediately re-raises it, repeat.
     // With IMO/FMO=0, Linux handles its own interrupts at EL1 via the GIC
     // directly — which is correct for a transparent hypervisor at this stage.
-    let hcr: u64 = (1 << 31) // RW
-                 | (1 << 0)  // VM
-                 | (1 << 1)  // SWIO
-                 | (1 << 2); // PTW
+    // NOTE: PTW (bit 2) is intentionally NOT set.
+    // HCR_EL2.PTW=1 enables "Protected Table Walk" — stage-2 enforces
+    // permissions on stage-1 page table walks. This means Linux's MMU
+    // hardware walker faults when it tries to read a page table entry
+    // stored in memory that stage-2 marks as non-executable (IFSC=0x0E,
+    // S1PTW=1). With PTW=0, stage-2 does not restrict stage-1 table walks,
+    // which is correct for a transparent type-2 hypervisor that trusts its guest.
+    let hcr: u64 = (1 << 31) // RW   — EL1 is AArch64
+                 | (1 << 0)  // VM   — stage-2 translation enabled
+                 | (1 << 1); // SWIO — software I/O coherency
 
     // SPSR_EL2 for Linux entry: EL1h (0b0101), DAIF masked
     // 0x3C5 = 0b0011_1100_0101
