@@ -207,8 +207,11 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
 fn launch_linux_on_core1(dtb_addr: usize) {
     // Trampoline lives at 1MB — well above our kernel (~57KB) and below Linux (0x80000+)
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    // Our own spin_cpu1 symbol at physical 0xE0 (kernel_old=1, kernel at 0x0)
-    const SPIN_CPU1: usize = 0xE0;
+    // spin_cpu1 is a data label in boot.rs placed by .ltorg after the code.
+    // Its address is determined by the linker (NOT hardcoded to 0xE0).
+    // This matches the rpi4-osdev tutorial approach exactly.
+    extern "C" { static mut spin_cpu1: u64; }
+    let spin_cpu1_addr = unsafe { &raw mut spin_cpu1 as usize };
 
     // HCR_EL2: RW=1 (AArch64 EL1), plus VM/SWIO/PTW/FMO/IMO/AMO
     let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | 1;
@@ -292,19 +295,19 @@ fn launch_linux_on_core1(dtb_addr: usize) {
             a1 = in(reg) TRAMPOLINE_ADDR + 64,
         );
 
-        // 4. Write TRAMPOLINE_ADDR to the armstub spin table entry for core 1.
-        //    Physical address 0xE0 (spin_cpu1 in armstub8.S).
+        // 4. Write TRAMPOLINE_ADDR to our own spin_cpu1 symbol.
+        //    Core 1 is parked in boot.rs reading this address via adr+ldr.
         //    Use dc civac to ensure core 1 sees the new value.
-        let spin = SPIN_CPU1 as *mut u64;
+        let spin = spin_cpu1_addr as *mut u64;
         spin.write_volatile(TRAMPOLINE_ADDR as u64);
         core::arch::asm!(
             "dc civac, {addr}",
             "dsb sy",
             "sev",
-            addr = in(reg) SPIN_CPU1,
+            addr = in(reg) spin_cpu1_addr,
         );
 
-        crate::kprintln!("[kernel] Core 1: spin table written, SEV sent");
+        crate::kprintln!("[kernel] Core 1: spin_cpu1@0x{:08X} written, SEV sent", spin_cpu1_addr);
     }
 }
 
