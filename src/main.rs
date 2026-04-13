@@ -64,6 +64,10 @@ pub extern "C" fn kernel_main() -> ! {
     gpio::init_led();
     gpio::blink(3, 200, 200);
     uart::init();
+    // With TF-A, the GPU display subsystem needs extra time to initialise
+    // before the VideoCore mailbox framebuffer request will succeed.
+    // A 500ms delay here ensures the GPU has finished its own boot sequence.
+    gpio::delay_ms(500);
     let fb_ok = framebuffer::init();
     if fb_ok { gpio::blink(5, 100, 100); }
 
