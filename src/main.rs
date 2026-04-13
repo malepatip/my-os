@@ -184,101 +184,123 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
     if found { offset } else { 0 }
 }
 
-/// Release core 1 to run Linux at EL1 using PSCI CPU_ON.
+/// Release core 1 to run Linux at EL1 using the official armstub8.S spin table.
 ///
-/// On Pi 4, the ARM Trusted Firmware (ATF) parks secondary cores using PSCI.
-/// The spin table at 0xE0 is NOT used on Pi 4 — that is a Pi 3 protocol.
-/// To wake core 1 we must issue an SMC call:
-///   x0 = 0xC4000003  (PSCI CPU_ON, 64-bit)
-///   x1 = 0x0000_0001  (target CPU MPIDR = core 1)
-///   x2 = entry_point  (physical address where core 1 starts)
-///   x3 = 0            (context_id, passed to entry in x0)
+/// The Pi 4 start4.elf firmware embeds armstub8.S at physical address 0x0.
+/// That stub parks cores 1-3 in a WFE loop reading from:
+///   Core 1: physical 0xE0  (spin_cpu1)
+///   Core 2: physical 0xE8  (spin_cpu2)
+///   Core 3: physical 0xF0  (spin_cpu3)
 ///
-/// The trampoline at TRAMPOLINE_ADDR sets up EL2 registers and ERETSs to EL1.
-/// PSCI will call the trampoline at EL2 (since we are at EL2).
+/// The stub's secondary_spin loop is:
+///   adr x5, spin_cpu0       // x5 = 0xD8
+///   wfe
+///   ldr x4, [x5, x6, lsl #3]  // x4 = *(0xD8 + core_id*8)
+///   cbz x4, secondary_spin
+///   mov x0, #0
+///   b boot_kernel           // br x4 with x0=0, x1=x2=x3=0
+///
+/// So we write TRAMPOLINE_ADDR to 0xE0, flush the D-cache line covering
+/// 0xE0 (so core 1 sees the new value), then send SEV to wake it.
+/// Core 1 will jump to our trampoline at EL2 with x0=0.
+/// The trampoline sets HCR_EL2, SPSR_EL2, ELR_EL2 and ERETSs to Linux at EL1.
 fn launch_linux_on_core1(dtb_addr: usize) {
+    // Trampoline lives at 1MB — well above our kernel (~57KB) and below Linux (0x80000+)
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    const PSCI_CPU_ON_64: u64 = 0xC400_0003;
-    const CORE1_MPIDR:    u64 = 0x0000_0001; // Aff0=1
+    // armstub8.S spin_cpu1 is at physical 0xE0
+    const SPIN_CPU1: usize = 0xE0;
 
-    let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0);
-    let spsr_value: u64 = 0x3C5; // EL1h, DAIF masked
+    // HCR_EL2: RW=1 (AArch64 EL1), plus VM/SWIO/PTW/FMO/IMO/AMO
+    let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | 1;
+    // SPSR_EL2: EL1h (0x5), DAIF all masked (bits 9:6 = 0b1111 = 0x3C0) => 0x3C5
+    let spsr_value: u64 = 0x3C5;
 
-    // Trampoline layout at TRAMPOLINE_ADDR:
-    //   [0..51]  13 instructions (52 bytes)
-    //   [52]     nop (4 bytes padding to 8-byte align)
-    //   [56]     dtb_addr    (u64)
+    // ── Trampoline layout at TRAMPOLINE_ADDR ─────────────────────────────────
+    // The armstub delivers core 1 here at EL2 with x0=0, x1=x2=x3=0.
+    // We must set up HCR_EL2/SPSR_EL2/ELR_EL2 then ERET to Linux at EL1.
+    //
+    // Byte offsets:
+    //   [0..51]  13 x u32 instructions
+    //   [52]     nop (pad to 8-byte align)
+    //   [56]     dtb_addr    (u64)  — LDR PC-relative offset from instr[0]
     //   [64]     linux_entry (u64)
     //   [72]     hcr_value   (u64)
     //   [80]     spsr_value  (u64)
     //
-    // Instructions:
-    //   ldr x9,  [pc, #56]  → dtb_addr
-    //   ldr x10, [pc, #60]  → linux_entry
-    //   ldr x11, [pc, #64]  → hcr_value
-    //   ldr x12, [pc, #68]  → spsr_value
-    //   mov x0, x9          → x0 = dtb (Linux boot protocol)
-    //   mov x1, xzr
-    //   mov x2, xzr
-    //   mov x3, xzr
-    //   msr spsr_el2, x12
-    //   msr elr_el2,  x10
-    //   msr hcr_el2,  x11
-    //   isb
-    //   eret                → drops to EL1, jumps to linux_entry
+    // LDR literal encoding: 0x58000000 | (imm19 << 5) | Rt
+    //   imm19 = (data_byte_offset - instr_byte_offset) / 4
+    //   instr[0] @ byte 0,  data @ byte 56: imm19 = 56/4 = 14 → 0x580001C9 (x9)
+    //   instr[1] @ byte 4,  data @ byte 64: imm19 = 60/4 = 15 → 0x580001EA (x10)
+    //   instr[2] @ byte 8,  data @ byte 72: imm19 = 64/4 = 16 → 0x5800020B (x11)
+    //   instr[3] @ byte 12, data @ byte 80: imm19 = 68/4 = 17 → 0x5800022C (x12)
+    //
+    // MSR encodings (from ARM ARM, confirmed correct):
+    //   msr spsr_el2, x12 = 0xD51C400C
+    //   msr elr_el2,  x10 = 0xD51C402A
+    //   msr hcr_el2,  x11 = 0xD5110C0B  ← S3_4_C1_C1_0
+    //
+    // mov x0, x9  = 0xAA0903E0
+    // mov x1, xzr = 0xAA1F03E1  (Linux boot protocol: x1=x2=x3=0)
+    // mov x2, xzr = 0xAA1F03E2
+    // mov x3, xzr = 0xAA1F03E3
     let trampoline_code: [u32; 13] = [
         0x580001C9u32, // [0]  ldr x9,  [pc, #56]  ; dtb_addr
         0x580001EAu32, // [4]  ldr x10, [pc, #60]  ; linux_entry
         0x5800020Bu32, // [8]  ldr x11, [pc, #64]  ; hcr_value
         0x5800022Cu32, // [12] ldr x12, [pc, #68]  ; spsr_value
-        0xAA0903E0u32, // [16] mov x0, x9          ; x0 = dtb_addr
+        0xAA0903E0u32, // [16] mov x0, x9          ; x0 = dtb_addr (Linux ABI)
         0xAA1F03E1u32, // [20] mov x1, xzr
         0xAA1F03E2u32, // [24] mov x2, xzr
         0xAA1F03E3u32, // [28] mov x3, xzr
         0xD51C400Cu32, // [32] msr spsr_el2, x12
         0xD51C402Au32, // [36] msr elr_el2,  x10
-        0xD51C110Bu32, // [40] msr hcr_el2,  x11
+        0xD51C110Bu32, // [40] msr hcr_el2,  x11  (S3_4_C1_C1_0 = 0xD51C110B)
         0xD5033FDFu32, // [44] isb
         0xD69F03E0u32, // [48] eret
     ];
 
     unsafe {
+        // 1. Write trampoline instructions to TRAMPOLINE_ADDR
         let t = TRAMPOLINE_ADDR as *mut u32;
         for (i, &word) in trampoline_code.iter().enumerate() {
             t.add(i).write_volatile(word);
         }
-        t.add(13).write_volatile(0xD503201Fu32); // nop padding
+        t.add(13).write_volatile(0xD503201Fu32); // nop padding at byte 52
 
+        // 2. Write data literals (u64 array, base = TRAMPOLINE_ADDR)
         let data = TRAMPOLINE_ADDR as *mut u64;
-        data.add(7).write_volatile(dtb_addr as u64);
-        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64);
-        data.add(9).write_volatile(hcr_value);
-        data.add(10).write_volatile(spsr_value);
+        data.add(7).write_volatile(dtb_addr as u64);                   // byte 56
+        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64); // byte 64
+        data.add(9).write_volatile(hcr_value);                         // byte 72
+        data.add(10).write_volatile(spsr_value);                       // byte 80
 
-        // Full cache flush: clean D-cache, invalidate I-cache
+        // 3. Clean D-cache for the trampoline range so core 1 sees it,
+        //    then invalidate I-cache so core 1 fetches fresh instructions.
+        //    We flush 2 cache lines (64 bytes each) to cover 88 bytes of trampoline.
         core::arch::asm!(
-            "dc cvac, {addr}",
+            "dc cvac, {a0}",
+            "dc cvac, {a1}",
             "dsb sy",
             "ic ialluis",
             "dsb sy",
             "isb",
-            addr = in(reg) TRAMPOLINE_ADDR,
+            a0 = in(reg) TRAMPOLINE_ADDR,
+            a1 = in(reg) TRAMPOLINE_ADDR + 64,
         );
 
-        // Issue PSCI CPU_ON via SMC to wake core 1
-        // ATF handles this and will call our trampoline at EL2
-        let mut ret: u64;
+        // 4. Write TRAMPOLINE_ADDR to the armstub spin table entry for core 1.
+        //    This is physical address 0xE0 (spin_cpu1 in armstub8.S).
+        //    CRITICAL: flush this cache line too so core 1's WFE/LDR sees it.
+        let spin = SPIN_CPU1 as *mut u64;
+        spin.write_volatile(TRAMPOLINE_ADDR as u64);
         core::arch::asm!(
-            "smc #0",
-            inout("x0") PSCI_CPU_ON_64 => ret,
-            in("x1") CORE1_MPIDR,
-            in("x2") TRAMPOLINE_ADDR as u64,
-            in("x3") 0u64,
-            options(nomem, nostack),
+            "dc cvac, {addr}",
+            "dsb sy",
+            "sev",
+            addr = in(reg) SPIN_CPU1,
         );
-        // ret = 0 means success, -2 (0xFFFFFFFFFFFFFFFE) means ALREADY_ON
-        // We print the result for diagnostics
-        crate::kprintln!("[kernel] PSCI CPU_ON ret=0x{:X}", ret);
+
+        crate::kprintln!("[kernel] Core 1: spin table written, SEV sent");
     }
 }
 
