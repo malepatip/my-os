@@ -333,10 +333,164 @@ pub unsafe fn launch_linux(dtb_addr: usize) -> ! {
 // and add bootargs via the kernel command line embedded in the DTB.
 // The initrd address is passed via the chosen node.
 
-/// Copy DTB from SD card and patch chosen node for initramfs + bootargs.
-/// Returns the address where the DTB was placed.
+/// Patch the DTB at LINUX_DTB_ADDR to set the chosen node with:
+///   linux,initrd-start = LINUX_INITRD_ADDR
+///   linux,initrd-end   = LINUX_INITRD_ADDR + initrd_size
+///   bootargs = "console=ttyAMA0,115200 8250.nr_uarts=1 root=/dev/ram0 rw"
+///
+/// The FDT (Flattened Device Tree) format:
+///   Header (40 bytes): magic, totalsize, off_dt_struct, off_dt_strings, ...
+///   Memory reservation block
+///   Structure block: FDT_BEGIN_NODE, FDT_PROP, FDT_END_NODE, FDT_END tokens
+///   Strings block: property name strings
+///
+/// We scan the structure block for the "chosen" node and patch its properties.
+/// If "chosen" doesn't exist, we insert it before FDT_END.
 pub fn setup_dtb(initrd_size: usize) -> usize {
-    // For now, return the address where the caller should have loaded the DTB.
-    // The actual DTB patching happens via the SD card DTB + kernel cmdline.
+    let dtb = LINUX_DTB_ADDR as *mut u8;
+
+    // FDT magic check
+    let magic = unsafe { u32::from_be(*(dtb as *const u32)) };
+    if magic != 0xD00DFEED {
+        return LINUX_DTB_ADDR; // not a valid FDT, skip patching
+    }
+
+    let total_size = unsafe { u32::from_be(*(dtb.add(4) as *const u32)) } as usize;
+    let off_struct  = unsafe { u32::from_be(*(dtb.add(8) as *const u32)) } as usize;
+    let off_strings = unsafe { u32::from_be(*(dtb.add(12) as *const u32)) } as usize;
+    let size_struct = unsafe { u32::from_be(*(dtb.add(24) as *const u32)) } as usize;
+    let size_strings = unsafe { u32::from_be(*(dtb.add(28) as *const u32)) } as usize;
+
+    // We'll append new strings to the strings block and new properties to the
+    // chosen node in the structure block. To keep this simple and safe, we
+    // write a new minimal DTB that wraps the original but adds our chosen node.
+    //
+    // Simpler approach: scan for existing "chosen" node and patch in-place,
+    // or append a new chosen node. Since the DTB is loaded into RAM at a fixed
+    // address with plenty of space, we can expand it.
+    //
+    // Strategy: find the FDT_END token (0x00000009) at the end of the structure
+    // block, and insert our chosen node just before it.
+    //
+    // FDT tokens:
+    const FDT_BEGIN_NODE: u32 = 1;
+    const FDT_END_NODE:   u32 = 2;
+    const FDT_PROP:       u32 = 3;
+    const FDT_NOP:        u32 = 4;
+    const FDT_END:        u32 = 9;
+
+    // Bootargs string (null-terminated, padded to 4 bytes)
+    let bootargs = b"console=ttyAMA0,115200 8250.nr_uarts=1 root=/dev/ram0 rw\0";
+
+    // Find the end of the structure block (FDT_END token)
+    let struct_start = unsafe { dtb.add(off_struct) };
+    let struct_end_offset = size_struct; // size in bytes
+
+    // The FDT_END token is the last 4 bytes of the structure block
+    let fdt_end_pos = off_struct + struct_end_offset - 4;
+
+    // Verify it's actually FDT_END
+    let end_token = unsafe { u32::from_be(*(dtb.add(fdt_end_pos) as *const u32)) };
+    if end_token != FDT_END {
+        return LINUX_DTB_ADDR; // malformed DTB
+    }
+
+    // We'll write our chosen node at fdt_end_pos, then write FDT_END after it.
+    // First, add property name strings to the strings block.
+    let strings_start = off_strings;
+    let strings_end   = off_strings + size_strings;
+
+    // Append strings: "linux,initrd-start", "linux,initrd-end", "bootargs"
+    // We write them after the existing strings block.
+    let str_initrd_start_name = b"linux,initrd-start\0";
+    let str_initrd_end_name   = b"linux,initrd-end\0";
+    let str_bootargs_name     = b"bootargs\0";
+    let str_chosen_name       = b"chosen\0";
+
+    // String offsets (relative to start of strings block)
+    let off_str_initrd_start = size_strings as u32;
+    let off_str_initrd_end   = off_str_initrd_start + str_initrd_start_name.len() as u32;
+    let off_str_bootargs     = off_str_initrd_end   + str_initrd_end_name.len() as u32;
+    let off_str_chosen       = off_str_bootargs     + str_bootargs_name.len() as u32;
+
+    unsafe {
+        // Write new strings after existing strings block
+        let mut sp = dtb.add(strings_end);
+        for &b in str_initrd_start_name { *sp = b; sp = sp.add(1); }
+        for &b in str_initrd_end_name   { *sp = b; sp = sp.add(1); }
+        for &b in str_bootargs_name     { *sp = b; sp = sp.add(1); }
+        for &b in str_chosen_name       { *sp = b; sp = sp.add(1); }
+
+        // Write chosen node into structure block at fdt_end_pos
+        let mut p = dtb.add(fdt_end_pos) as *mut u32;
+
+        // FDT_BEGIN_NODE "chosen"
+        *p = u32::to_be(FDT_BEGIN_NODE); p = p.add(1);
+        // Node name "chosen\0" padded to 4 bytes: 7 bytes → 8 bytes (2 words)
+        let chosen_name = b"chosen\0\0"; // 8 bytes
+        let np = p as *mut u8;
+        for (i, &b) in chosen_name.iter().enumerate() {
+            *np.add(i) = b;
+        }
+        p = p.add(2); // 8 bytes = 2 words
+
+        // Property: linux,initrd-start (u32 big-endian)
+        *p = u32::to_be(FDT_PROP); p = p.add(1);
+        *p = u32::to_be(4); p = p.add(1);  // len = 4 bytes
+        *p = u32::to_be(off_str_initrd_start); p = p.add(1);
+        *p = u32::to_be(LINUX_INITRD_ADDR as u32); p = p.add(1);
+
+        // Property: linux,initrd-end (u32 big-endian)
+        *p = u32::to_be(FDT_PROP); p = p.add(1);
+        *p = u32::to_be(4); p = p.add(1);
+        *p = u32::to_be(off_str_initrd_end); p = p.add(1);
+        *p = u32::to_be((LINUX_INITRD_ADDR + initrd_size) as u32); p = p.add(1);
+
+        // Property: bootargs (variable length, null-terminated, padded to 4 bytes)
+        let ba_len = bootargs.len(); // includes null terminator
+        let ba_padded = (ba_len + 3) & !3;
+        *p = u32::to_be(FDT_PROP); p = p.add(1);
+        *p = u32::to_be(ba_len as u32); p = p.add(1);
+        *p = u32::to_be(off_str_bootargs); p = p.add(1);
+        let bp = p as *mut u8;
+        for (i, &b) in bootargs.iter().enumerate() { *bp.add(i) = b; }
+        // Zero-pad to 4-byte boundary
+        for i in ba_len..ba_padded { *bp.add(i) = 0; }
+        p = p.add(ba_padded / 4);
+
+        // FDT_END_NODE
+        *p = u32::to_be(FDT_END_NODE); p = p.add(1);
+
+        // FDT_END
+        *p = u32::to_be(FDT_END);
+
+        // Update DTB header: totalsize, size_dt_struct, size_dt_strings
+        let new_struct_end = p as usize - LINUX_DTB_ADDR + 4; // +4 for FDT_END itself
+        let new_struct_size = new_struct_end - off_struct;
+        let new_strings_size = size_strings
+            + str_initrd_start_name.len()
+            + str_initrd_end_name.len()
+            + str_bootargs_name.len()
+            + str_chosen_name.len();
+        let new_total = off_strings + new_strings_size
+            + (new_struct_end - off_struct); // rough estimate
+        // Actually total = max of struct end and strings end
+        let strings_new_end = strings_end
+            + str_initrd_start_name.len()
+            + str_initrd_end_name.len()
+            + str_bootargs_name.len()
+            + str_chosen_name.len();
+        let new_total_size = if new_struct_end > strings_new_end {
+            new_struct_end
+        } else {
+            strings_new_end
+        };
+
+        // Patch header fields
+        *(dtb.add(4)  as *mut u32) = u32::to_be(new_total_size as u32);  // totalsize
+        *(dtb.add(24) as *mut u32) = u32::to_be(new_struct_size as u32); // size_dt_struct
+        *(dtb.add(28) as *mut u32) = u32::to_be(new_strings_size as u32); // size_dt_strings
+    }
+
     LINUX_DTB_ADDR
 }

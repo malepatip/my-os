@@ -110,10 +110,40 @@ global_asm!(
     // Jump to Rust init (we are now at EL2 with a valid stack).
     "b {rust_init}",
 
-    // ── Park loop ────────────────────────────────────────────────────────────
+    // ── Park loop — Pi 4 spin table protocol ─────────────────────────────────
+    // Cores 1-3 park here. They watch their spin table entry at:
+    //   Core 1: 0xE0, Core 2: 0xE8, Core 3: 0xF0
+    // When core 0 writes a non-zero address and sends SEV, the core
+    // wakes, reads the address, and branches to it.
+    // The spin table base is 0xD8. Core N entry = 0xD8 + N*8.
     ".L_park:",
+    // x8 = core_id (already computed above as MPIDR.Aff0)
+    "mov x9, #0xD8",           // spin table base
+    "add x9, x9, x8, lsl #3", // x9 = 0xD8 + core_id * 8
+    ".L_park_loop:",
     "wfe",
-    "b .L_park",
+    "ldr x10, [x9]",           // load spin table entry
+    "cbz x10, .L_park_loop",   // if zero, keep waiting
+    // Non-zero: set up minimal EL2 environment for core 1
+    // Set HCR_EL2: RW=1 (EL1 is AArch64)
+    "mov x11, #(1 << 31)",
+    "msr hcr_el2, x11",
+    "isb",
+    // Allow EL1 timer access
+    "mrs x11, cnthctl_el2",
+    "orr x11, x11, #0x3",
+    "msr cnthctl_el2, x11",
+    "msr cntvoff_el2, xzr",
+    // Disable coprocessor traps
+    "mov x11, #0x33ff",
+    "msr cptr_el2, x11",
+    "msr hstr_el2, xzr",
+    // Set up a stack for core 1 (0x00280000, below core 0's stack at 0x002A0000)
+    "movz x11, #0x0000",
+    "movk x11, #0x28, lsl #16",
+    "mov sp, x11",
+    // Branch to the trampoline address
+    "br x10",
 
     rust_init = sym rust_init,
 );

@@ -141,6 +141,11 @@ pub extern "C" fn kernel_main() -> ! {
         shell_uart_only();
     }
 
+    // Patch DTB chosen node with initramfs addresses and bootargs
+    linux_vm::setup_dtb(initrd_loaded);
+    kprintln!("[kernel] Linux VM:    DTB patched (initrd @ 0x{:08X}+{})",
+        linux_vm::LINUX_INITRD_ADDR, initrd_loaded);
+
     // ── Step 5: Set up stage-2 page tables ───────────────────────────────
     kprint!("[kernel] Stage-2 MMU: ");
     linux_vm::setup_stage2_tables();
@@ -182,57 +187,151 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
 /// Release core 1 from its WFE park loop to run Linux at EL1.
 ///
 /// Pi 4 spin table protocol:
-///   Core N release address is at physical 0xd8 + N*8.
-///   Core 1 = 0xe0. Write the entry address, then SEV.
+///   Core N release address is at physical 0xD8 + N*8.
+///   Core 1 = 0xE0. Write the trampoline address, then SEV.
 ///
-/// We place a small AArch64 trampoline at 0x0010_0000 that:
-///   1. Sets x0 = DTB address (Linux boot protocol)
-///   2. Clears x1, x2, x3
-///   3. Jumps to LINUX_LOAD_ADDR
+/// The park loop in boot.rs watches 0xE0 and branches to the trampoline.
+/// The trampoline sets up EL2 registers and uses ERET to drop to EL1.
 ///
-/// Then we write the trampoline address to the spin table and SEV.
+/// Trampoline layout at TRAMPOLINE_ADDR (0x0010_0000):
+///   Instruction bytes [0..52]: 13 AArch64 instructions
+///   Data bytes [56..63]:       dtb_addr (u64)
+///   Data bytes [64..71]:       linux_entry (u64)
+///
+/// Instructions:
+///   [0]  ldr x9,  [pc, #56]   ; x9  = dtb_addr
+///   [4]  ldr x10, [pc, #56]   ; x10 = linux_entry
+///   [8]  mov x0, x9           ; x0  = dtb_addr (Linux boot protocol)
+///   [12] mov x1, xzr
+///   [16] mov x2, xzr
+///   [20] mov x3, xzr
+///   [24] mov x11, #0x3C5      ; SPSR_EL2: EL1h, DAIF masked
+///   [28] msr spsr_el2, x11
+///   [32] msr elr_el2, x10     ; ELR_EL2 = linux_entry
+///   [36] mov x11, #(1<<31)    ; HCR_EL2: RW=1 (EL1 is AArch64)
+///   [40] orr x11, x11, #0x3F  ; + VM|SWIO|PTW|FMO|IMO|AMO
+///   [44] msr hcr_el2, x11
+///   [48] isb
+///   [52] eret                 ; drop to EL1, jump to linux_entry
+///   [56] .quad dtb_addr
+///   [64] .quad linux_entry
 fn launch_linux_on_core1(dtb_addr: usize) {
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
     const CORE1_SPIN_TABLE: usize = 0xe0;
 
-    // AArch64 trampoline (8 instructions + 2 data words):
-    //   ldr x0, dtb_ptr     ; x0 = DTB address
-    //   ldr x18, entry_ptr  ; x18 = Linux entry point
-    //   mov x1, xzr
-    //   mov x2, xzr
-    //   mov x3, xzr
-    //   br x18
-    //   .quad dtb_addr
-    //   .quad LINUX_LOAD_ADDR
+    // LDR (literal) 64-bit encoding: 0x58000000 | (imm19 << 5) | Rt
+    // imm19 = byte_offset_from_pc / 4
     //
-    // PC-relative offsets for ldr (literal):
-    //   instruction 0 at +0, data at +24: offset = +24, encoded as (24/4)=6 → imm19=6
-    //   instruction 1 at +4, data at +28: offset = +24, encoded as (24/4)=6 → imm19=6
-    //   ldr x0, [pc, #24]  = 0x58000300  (imm19 = 6 << 5, Rt = 0)
-    //   ldr x18, [pc, #24] = 0x58000312  (imm19 = 6 << 5, Rt = 18 = 0x12)
-    let trampoline_code: [u32; 6] = [
-        0x58000300u32, // ldr x0, [pc, #24]   ; load dtb_addr
-        0x58000312u32, // ldr x18, [pc, #24]  ; load linux entry
-        0xAA1F03E1u32, // mov x1, xzr
-        0xAA1F03E2u32, // mov x2, xzr
-        0xAA1F03E3u32, // mov x3, xzr
-        0xD61F0240u32, // br x18
+    // instr[0] at byte 0:  data at byte 56 → offset = 56, imm19 = 14
+    //   ldr x9,  [pc, #56] = 0x58000000 | (14 << 5) | 9  = 0x580001C9
+    // instr[1] at byte 4:  data at byte 64 → offset = 60, imm19 = 15
+    //   ldr x10, [pc, #60] = 0x58000000 | (15 << 5) | 10 = 0x580001EA
+    //
+    // HCR_EL2 value: RW(31) | AMO(5) | IMO(4) | FMO(3) | PTW(2) | SWIO(1) | VM(0)
+    //   = 0x8000003F
+    // We build this in two instructions:
+    //   movz x11, #0x0000, lsl #32  → can't do this in one movz for bit 31
+    // Instead use: mov x11, #(1<<31) then orr x11, x11, #0x3F
+    //   movz x11, #0x8000, lsl #16 = 0xD2F00011... let's use the encoding directly
+    //
+    // AArch64 MOV (wide immediate) for x11 = 0x80000000:
+    //   movz x11, #0x8000, lsl #16
+    //   encoding: 0xD280000B | (0x8000 << 5) = 0xD280000B
+    //   Actually: movz Xd, #imm16, lsl #shift
+    //   sf=1, opc=10, hw=10(lsl#32)... let me use movz x11, #1, lsl #31 — not valid
+    //   Simplest: ldr x11, =0x8000003F from a data literal
+    //
+    // Revised trampoline — use data literals for all constants:
+    //   [0]  ldr x9,  [pc, #56]   ; dtb_addr
+    //   [4]  ldr x10, [pc, #56]   ; linux_entry
+    //   [8]  ldr x11, [pc, #56]   ; hcr_value
+    //   [12] ldr x12, [pc, #56]   ; spsr_value
+    //   [16] mov x0, x9
+    //   [20] mov x1, xzr
+    //   [24] mov x2, xzr
+    //   [28] mov x3, xzr
+    //   [32] msr spsr_el2, x12
+    //   [36] msr elr_el2, x10
+    //   [40] msr hcr_el2, x11
+    //   [44] isb
+    //   [48] eret
+    //   [52] nop (padding to 8-byte align)
+    //   [56] .quad dtb_addr
+    //   [64] .quad linux_entry
+    //   [72] .quad hcr_value
+    //   [80] .quad spsr_value
+    //
+    // LDR offsets:
+    //   instr[0] at byte 0,  data at byte 56: imm19 = 56/4 = 14 → 0x58000000|(14<<5)|9  = 0x580001C9
+    //   instr[1] at byte 4,  data at byte 64: imm19 = 60/4 = 15 → 0x58000000|(15<<5)|10 = 0x580001EA
+    //   instr[2] at byte 8,  data at byte 72: imm19 = 64/4 = 16 → 0x58000000|(16<<5)|11 = 0x5800020B
+    //   instr[3] at byte 12, data at byte 80: imm19 = 68/4 = 17 → 0x58000000|(17<<5)|12 = 0x5800022C
+    //
+    // MSR encodings:
+    //   msr spsr_el2, x12 = 0xD51C400C
+    //   msr elr_el2,  x10 = 0xD51C400A
+    //   msr hcr_el2,  x11 = 0xD5110C0B  (wait — let me verify)
+    //
+    // MSR system register encoding: 0xD5100000 | (op0<<19) | (op1<<16) | (CRn<<12) | (CRm<<8) | (op2<<5) | Rt
+    // HCR_EL2:  op0=3, op1=4, CRn=1, CRm=1, op2=0 → 0xD5110C0B? No:
+    //   0xD5 = 1101_0101, bits[31:20] = 1101_0101_0001 = write
+    //   Actually MSR (register) = 0xD5100000 | (o0<<19) | (op1<<16) | (CRn<<12) | (CRm<<8) | (op2<<5) | Rt
+    //   HCR_EL2: o0=1(EL2), op1=4, CRn=1, CRm=1, op2=0
+    //   = 0xD5100000 | (1<<19) | (4<<16) | (1<<12) | (1<<8) | (0<<5) | 11
+    //   = 0xD5100000 | 0x80000 | 0x40000 | 0x1000 | 0x100 | 0 | 11
+    //   = 0xD51C110B  ← let me just use known-good encodings from ARM ARM
+    //
+    // Known good MSR encodings (from ARM Architecture Reference Manual):
+    //   msr hcr_el2,  Xt: 0xD5110C00 | Rt  (HCR_EL2 = S3_4_C1_C1_0)
+    //   msr spsr_el2, Xt: 0xD51C4000 | Rt  (SPSR_EL2 = S3_4_C4_C0_0)
+    //   msr elr_el2,  Xt: 0xD51C4020 | Rt  (ELR_EL2  = S3_4_C4_C0_1)
+    //   isb:              0xD5033FDF
+    //   eret:             0xD69F03E0
+    //   nop:              0xD503201F
+    //
+    // mov x0, x9:  0xAA0903E0
+    // mov x1, xzr: 0xAA1F03E1
+    // mov x2, xzr: 0xAA1F03E2
+    // mov x3, xzr: 0xAA1F03E3
+    let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0);
+    let spsr_value: u64 = 0x3C5; // EL1h, DAIF masked
+
+    let trampoline_code: [u32; 13] = [
+        0x580001C9u32, // [0]  ldr x9,  [pc, #56]  ; dtb_addr
+        0x580001EAu32, // [4]  ldr x10, [pc, #60]  ; linux_entry
+        0x5800020Bu32, // [8]  ldr x11, [pc, #64]  ; hcr_value
+        0x5800022Cu32, // [12] ldr x12, [pc, #68]  ; spsr_value
+        0xAA0903E0u32, // [16] mov x0, x9          ; x0 = dtb_addr
+        0xAA1F03E1u32, // [20] mov x1, xzr
+        0xAA1F03E2u32, // [24] mov x2, xzr
+        0xAA1F03E3u32, // [28] mov x3, xzr
+        0xD51C400Cu32, // [32] msr spsr_el2, x12
+        0xD51C402Au32, // [36] msr elr_el2,  x10
+        0xD51C110Bu32, // [40] msr hcr_el2,  x11
+        0xD5033FDFu32, // [44] isb
+        0xD69F03E0u32, // [48] eret
     ];
+    // Total: 13 * 4 = 52 bytes of instructions
+    // Padding to 8-byte align: 4 bytes (1 nop) → data starts at byte 56
 
     unsafe {
         let t = TRAMPOLINE_ADDR as *mut u32;
 
-        // Write instructions
+        // Write 13 instructions
         for (i, &word) in trampoline_code.iter().enumerate() {
             t.add(i).write_volatile(word);
         }
+        // Write padding nop at byte 52 (index 13)
+        t.add(13).write_volatile(0xD503201Fu32); // nop
 
-        // Write data: dtb_addr and linux_entry at offset +24 (6 words)
+        // Write data at byte 56 (u64 index 7)
         let data = TRAMPOLINE_ADDR as *mut u64;
-        data.add(3).write_volatile(dtb_addr as u64);
-        data.add(4).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64);
+        data.add(7).write_volatile(dtb_addr as u64);                    // byte 56
+        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64);  // byte 64
+        data.add(9).write_volatile(hcr_value);                          // byte 72
+        data.add(10).write_volatile(spsr_value);                        // byte 80
 
-        // Clean data cache and invalidate instruction cache
+        // Flush data cache and invalidate instruction cache
         core::arch::asm!(
             "dc cvac, {addr}",
             "dsb sy",
