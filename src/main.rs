@@ -184,118 +184,48 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
     if found { offset } else { 0 }
 }
 
-/// Release core 1 from its WFE park loop to run Linux at EL1.
+/// Release core 1 to run Linux at EL1 using PSCI CPU_ON.
 ///
-/// Pi 4 spin table protocol:
-///   Core N release address is at physical 0xD8 + N*8.
-///   Core 1 = 0xE0. Write the trampoline address, then SEV.
+/// On Pi 4, the ARM Trusted Firmware (ATF) parks secondary cores using PSCI.
+/// The spin table at 0xE0 is NOT used on Pi 4 — that is a Pi 3 protocol.
+/// To wake core 1 we must issue an SMC call:
+///   x0 = 0xC4000003  (PSCI CPU_ON, 64-bit)
+///   x1 = 0x0000_0001  (target CPU MPIDR = core 1)
+///   x2 = entry_point  (physical address where core 1 starts)
+///   x3 = 0            (context_id, passed to entry in x0)
 ///
-/// The park loop in boot.rs watches 0xE0 and branches to the trampoline.
-/// The trampoline sets up EL2 registers and uses ERET to drop to EL1.
-///
-/// Trampoline layout at TRAMPOLINE_ADDR (0x0010_0000):
-///   Instruction bytes [0..52]: 13 AArch64 instructions
-///   Data bytes [56..63]:       dtb_addr (u64)
-///   Data bytes [64..71]:       linux_entry (u64)
-///
-/// Instructions:
-///   [0]  ldr x9,  [pc, #56]   ; x9  = dtb_addr
-///   [4]  ldr x10, [pc, #56]   ; x10 = linux_entry
-///   [8]  mov x0, x9           ; x0  = dtb_addr (Linux boot protocol)
-///   [12] mov x1, xzr
-///   [16] mov x2, xzr
-///   [20] mov x3, xzr
-///   [24] mov x11, #0x3C5      ; SPSR_EL2: EL1h, DAIF masked
-///   [28] msr spsr_el2, x11
-///   [32] msr elr_el2, x10     ; ELR_EL2 = linux_entry
-///   [36] mov x11, #(1<<31)    ; HCR_EL2: RW=1 (EL1 is AArch64)
-///   [40] orr x11, x11, #0x3F  ; + VM|SWIO|PTW|FMO|IMO|AMO
-///   [44] msr hcr_el2, x11
-///   [48] isb
-///   [52] eret                 ; drop to EL1, jump to linux_entry
-///   [56] .quad dtb_addr
-///   [64] .quad linux_entry
+/// The trampoline at TRAMPOLINE_ADDR sets up EL2 registers and ERETSs to EL1.
+/// PSCI will call the trampoline at EL2 (since we are at EL2).
 fn launch_linux_on_core1(dtb_addr: usize) {
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    const CORE1_SPIN_TABLE: usize = 0xe0;
+    const PSCI_CPU_ON_64: u64 = 0xC400_0003;
+    const CORE1_MPIDR:    u64 = 0x0000_0001; // Aff0=1
 
-    // LDR (literal) 64-bit encoding: 0x58000000 | (imm19 << 5) | Rt
-    // imm19 = byte_offset_from_pc / 4
-    //
-    // instr[0] at byte 0:  data at byte 56 → offset = 56, imm19 = 14
-    //   ldr x9,  [pc, #56] = 0x58000000 | (14 << 5) | 9  = 0x580001C9
-    // instr[1] at byte 4:  data at byte 64 → offset = 60, imm19 = 15
-    //   ldr x10, [pc, #60] = 0x58000000 | (15 << 5) | 10 = 0x580001EA
-    //
-    // HCR_EL2 value: RW(31) | AMO(5) | IMO(4) | FMO(3) | PTW(2) | SWIO(1) | VM(0)
-    //   = 0x8000003F
-    // We build this in two instructions:
-    //   movz x11, #0x0000, lsl #32  → can't do this in one movz for bit 31
-    // Instead use: mov x11, #(1<<31) then orr x11, x11, #0x3F
-    //   movz x11, #0x8000, lsl #16 = 0xD2F00011... let's use the encoding directly
-    //
-    // AArch64 MOV (wide immediate) for x11 = 0x80000000:
-    //   movz x11, #0x8000, lsl #16
-    //   encoding: 0xD280000B | (0x8000 << 5) = 0xD280000B
-    //   Actually: movz Xd, #imm16, lsl #shift
-    //   sf=1, opc=10, hw=10(lsl#32)... let me use movz x11, #1, lsl #31 — not valid
-    //   Simplest: ldr x11, =0x8000003F from a data literal
-    //
-    // Revised trampoline — use data literals for all constants:
-    //   [0]  ldr x9,  [pc, #56]   ; dtb_addr
-    //   [4]  ldr x10, [pc, #56]   ; linux_entry
-    //   [8]  ldr x11, [pc, #56]   ; hcr_value
-    //   [12] ldr x12, [pc, #56]   ; spsr_value
-    //   [16] mov x0, x9
-    //   [20] mov x1, xzr
-    //   [24] mov x2, xzr
-    //   [28] mov x3, xzr
-    //   [32] msr spsr_el2, x12
-    //   [36] msr elr_el2, x10
-    //   [40] msr hcr_el2, x11
-    //   [44] isb
-    //   [48] eret
-    //   [52] nop (padding to 8-byte align)
-    //   [56] .quad dtb_addr
-    //   [64] .quad linux_entry
-    //   [72] .quad hcr_value
-    //   [80] .quad spsr_value
-    //
-    // LDR offsets:
-    //   instr[0] at byte 0,  data at byte 56: imm19 = 56/4 = 14 → 0x58000000|(14<<5)|9  = 0x580001C9
-    //   instr[1] at byte 4,  data at byte 64: imm19 = 60/4 = 15 → 0x58000000|(15<<5)|10 = 0x580001EA
-    //   instr[2] at byte 8,  data at byte 72: imm19 = 64/4 = 16 → 0x58000000|(16<<5)|11 = 0x5800020B
-    //   instr[3] at byte 12, data at byte 80: imm19 = 68/4 = 17 → 0x58000000|(17<<5)|12 = 0x5800022C
-    //
-    // MSR encodings:
-    //   msr spsr_el2, x12 = 0xD51C400C
-    //   msr elr_el2,  x10 = 0xD51C400A
-    //   msr hcr_el2,  x11 = 0xD5110C0B  (wait — let me verify)
-    //
-    // MSR system register encoding: 0xD5100000 | (op0<<19) | (op1<<16) | (CRn<<12) | (CRm<<8) | (op2<<5) | Rt
-    // HCR_EL2:  op0=3, op1=4, CRn=1, CRm=1, op2=0 → 0xD5110C0B? No:
-    //   0xD5 = 1101_0101, bits[31:20] = 1101_0101_0001 = write
-    //   Actually MSR (register) = 0xD5100000 | (o0<<19) | (op1<<16) | (CRn<<12) | (CRm<<8) | (op2<<5) | Rt
-    //   HCR_EL2: o0=1(EL2), op1=4, CRn=1, CRm=1, op2=0
-    //   = 0xD5100000 | (1<<19) | (4<<16) | (1<<12) | (1<<8) | (0<<5) | 11
-    //   = 0xD5100000 | 0x80000 | 0x40000 | 0x1000 | 0x100 | 0 | 11
-    //   = 0xD51C110B  ← let me just use known-good encodings from ARM ARM
-    //
-    // Known good MSR encodings (from ARM Architecture Reference Manual):
-    //   msr hcr_el2,  Xt: 0xD5110C00 | Rt  (HCR_EL2 = S3_4_C1_C1_0)
-    //   msr spsr_el2, Xt: 0xD51C4000 | Rt  (SPSR_EL2 = S3_4_C4_C0_0)
-    //   msr elr_el2,  Xt: 0xD51C4020 | Rt  (ELR_EL2  = S3_4_C4_C0_1)
-    //   isb:              0xD5033FDF
-    //   eret:             0xD69F03E0
-    //   nop:              0xD503201F
-    //
-    // mov x0, x9:  0xAA0903E0
-    // mov x1, xzr: 0xAA1F03E1
-    // mov x2, xzr: 0xAA1F03E2
-    // mov x3, xzr: 0xAA1F03E3
     let hcr_value:  u64 = (1u64 << 31) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2) | (1 << 1) | (1 << 0);
     let spsr_value: u64 = 0x3C5; // EL1h, DAIF masked
 
+    // Trampoline layout at TRAMPOLINE_ADDR:
+    //   [0..51]  13 instructions (52 bytes)
+    //   [52]     nop (4 bytes padding to 8-byte align)
+    //   [56]     dtb_addr    (u64)
+    //   [64]     linux_entry (u64)
+    //   [72]     hcr_value   (u64)
+    //   [80]     spsr_value  (u64)
+    //
+    // Instructions:
+    //   ldr x9,  [pc, #56]  → dtb_addr
+    //   ldr x10, [pc, #60]  → linux_entry
+    //   ldr x11, [pc, #64]  → hcr_value
+    //   ldr x12, [pc, #68]  → spsr_value
+    //   mov x0, x9          → x0 = dtb (Linux boot protocol)
+    //   mov x1, xzr
+    //   mov x2, xzr
+    //   mov x3, xzr
+    //   msr spsr_el2, x12
+    //   msr elr_el2,  x10
+    //   msr hcr_el2,  x11
+    //   isb
+    //   eret                → drops to EL1, jumps to linux_entry
     let trampoline_code: [u32; 13] = [
         0x580001C9u32, // [0]  ldr x9,  [pc, #56]  ; dtb_addr
         0x580001EAu32, // [4]  ldr x10, [pc, #60]  ; linux_entry
@@ -311,27 +241,21 @@ fn launch_linux_on_core1(dtb_addr: usize) {
         0xD5033FDFu32, // [44] isb
         0xD69F03E0u32, // [48] eret
     ];
-    // Total: 13 * 4 = 52 bytes of instructions
-    // Padding to 8-byte align: 4 bytes (1 nop) → data starts at byte 56
 
     unsafe {
         let t = TRAMPOLINE_ADDR as *mut u32;
-
-        // Write 13 instructions
         for (i, &word) in trampoline_code.iter().enumerate() {
             t.add(i).write_volatile(word);
         }
-        // Write padding nop at byte 52 (index 13)
-        t.add(13).write_volatile(0xD503201Fu32); // nop
+        t.add(13).write_volatile(0xD503201Fu32); // nop padding
 
-        // Write data at byte 56 (u64 index 7)
         let data = TRAMPOLINE_ADDR as *mut u64;
-        data.add(7).write_volatile(dtb_addr as u64);                    // byte 56
-        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64);  // byte 64
-        data.add(9).write_volatile(hcr_value);                          // byte 72
-        data.add(10).write_volatile(spsr_value);                        // byte 80
+        data.add(7).write_volatile(dtb_addr as u64);
+        data.add(8).write_volatile(linux_vm::LINUX_LOAD_ADDR as u64);
+        data.add(9).write_volatile(hcr_value);
+        data.add(10).write_volatile(spsr_value);
 
-        // Flush data cache and invalidate instruction cache
+        // Full cache flush: clean D-cache, invalidate I-cache
         core::arch::asm!(
             "dc cvac, {addr}",
             "dsb sy",
@@ -341,16 +265,20 @@ fn launch_linux_on_core1(dtb_addr: usize) {
             addr = in(reg) TRAMPOLINE_ADDR,
         );
 
-        // Write trampoline address to core 1 spin table entry
-        let spin = CORE1_SPIN_TABLE as *mut u64;
-        spin.write_volatile(TRAMPOLINE_ADDR as u64);
-
-        // Memory barrier + send event to wake core 1
+        // Issue PSCI CPU_ON via SMC to wake core 1
+        // ATF handles this and will call our trampoline at EL2
+        let mut ret: u64;
         core::arch::asm!(
-            "dsb sy",
-            "sev",
+            "smc #0",
+            inout("x0") PSCI_CPU_ON_64 => ret,
+            in("x1") CORE1_MPIDR,
+            in("x2") TRAMPOLINE_ADDR as u64,
+            in("x3") 0u64,
             options(nomem, nostack),
         );
+        // ret = 0 means success, -2 (0xFFFFFFFFFFFFFFFE) means ALREADY_ON
+        // We print the result for diagnostics
+        crate::kprintln!("[kernel] PSCI CPU_ON ret=0x{:X}", ret);
     }
 }
 
