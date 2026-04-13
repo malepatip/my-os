@@ -370,13 +370,16 @@ fn set_clock(base_hz: u32, target_hz: u32) {
 fn send_cmd(cmd: u32, arg: u32) -> u32 {
     if cmd & CMD_NEED_APP != 0 {
         let rca = unsafe { SD_RCA };
+        // CMD55 with RCA=0 (before card is selected): use no CRC/index check
+        // CMD55 with RCA!=0 (after card is selected): use full R1 response
         let cmd55_flags = if rca != 0 {
             CMD55
         } else {
-            (55 << 24) | CMD_RSPNS_48
+            (55 << 24) | CMD_RSPNS_48  // R1 response, no CRC/IX check
         };
         let r = send_cmd(cmd55_flags, rca << 16);
         if r == 0xFFFF_FFFF { return 0xFFFF_FFFF; }
+        // Only check APP_CMD bit if we have an RCA (card is selected)
         if rca != 0 && rd(EMMC_STATUS) & SR_APP_CMD == 0 {
             return 0xFFFF_FFFF;
         }
@@ -416,14 +419,19 @@ pub fn sd_init() -> bool {
     let base_hz = get_emmc_clock_hz();
 
     // ── Step 2: Reset host controller ────────────────────────────────────────
+    // Circle: OR in the reset bit, do NOT overwrite the whole register.
+    // Wait for bits 26:24 (7<<24) to ALL clear, not just bit 24.
+    // Source: Circle/addon/SDCard/emmc.cpp lines 1440-1450
     wr(EMMC_CONTROL2, 0);
     wr(EMMC_CONTROL0, 0);
-    wr(EMMC_CONTROL1, C1_SRST_HC);
+    let c1 = rd(EMMC_CONTROL1) | C1_SRST_HC;
+    wr(EMMC_CONTROL1, c1);
     sleep_ms(10);
     let limit = 100 * ITERS_PER_MS;
     let mut reset_ok = false;
     for _ in 0..limit {
-        if rd(EMMC_CONTROL1) & C1_SRST_HC == 0 { reset_ok = true; break; }
+        // Wait for ALL reset bits (26:24) to clear, not just bit 24
+        if rd(EMMC_CONTROL1) & (7 << 24) == 0 { reset_ok = true; break; }
         unsafe { core::arch::asm!("nop", options(nostack, nomem)) };
     }
     if !reset_ok { return false; }
@@ -443,8 +451,13 @@ pub fn sd_init() -> bool {
     wr(EMMC_IRPT_MASK, 0xFFFF_FFFF);
 
     // ── Step 6: CMD0 — GO_IDLE_STATE ─────────────────────────────────────────
-    send_cmd(CMD0, 0);
+    // CMD0 has no response. Clear any pending interrupts first, then send.
+    // Do NOT check the return value — timeout error is expected for CMD0.
+    wr(EMMC_INTERRUPT, 0xFFFF_FFFF);
+    wr(EMMC_ARG1, 0);
+    wr(EMMC_CMDTM, CMD0);
     sleep_ms(2);
+    wr(EMMC_INTERRUPT, 0xFFFF_FFFF); // clear any timeout from CMD0
 
     // ── Step 7: CMD8 — SEND_IF_COND ──────────────────────────────────────────
     let r8 = send_cmd(CMD8, 0x0000_01AA);
