@@ -48,18 +48,13 @@ flash: build-pi4
 	    echo "       Insert SD card, then in ChromeOS Files app:"; \
 	    echo "       right-click the SD card → Share with Linux"; \
 	    exit 1; }
-	@python3 -c "\
-import os; \
-src='sdcard'; dst='$(SD_BOOT)'; \
-files=['config.txt','start4.elf','fixup4.dat','bcm2711-rpi-4-b.dtb','kernel8.img','bl31.bin']; \
-[( \
-  d:=open(os.path.join(dst,f),'wb'), \
-  d.write(open(os.path.join(src,f),'rb').read()), \
-  d.flush(), os.fsync(d.fileno()), d.close(), \
-  print(f'  {f}: ok') \
-) for f in files]; \
-fd=os.open(dst,os.O_RDONLY); os.fsync(fd); os.close(fd) \
-"
+	cp sdcard/config.txt          $(SD_BOOT)/config.txt          && echo "  config.txt: ok"
+	cp sdcard/start4.elf          $(SD_BOOT)/start4.elf          && echo "  start4.elf: ok"
+	cp sdcard/fixup4.dat          $(SD_BOOT)/fixup4.dat          && echo "  fixup4.dat: ok"
+	cp sdcard/bcm2711-rpi-4-b.dtb $(SD_BOOT)/bcm2711-rpi-4-b.dtb && echo "  bcm2711-rpi-4-b.dtb: ok"
+	cp sdcard/bl31.bin            $(SD_BOOT)/bl31.bin            && echo "  bl31.bin: ok"
+	cp $(KERNEL_BIN)              $(SD_BOOT)/kernel8.img         && echo "  kernel8.img: ok"
+	sync
 	@echo "[flash] Done — eject SD card from ChromeOS Files app, then boot Pi 4."
 
 # ── Open UART console (requires USB-to-TTL adapter) ──────────────────────────

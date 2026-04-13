@@ -80,7 +80,7 @@ pub extern "C" fn kernel_main() -> ! {
     kprintln!("");
     kprintln!("[kernel] UART:        OK @ 0x{:08X}", uart::base_address());
     if fb_ok {
-        kprintln!("[kernel] Framebuffer: OK (1920x1080 @ 32bpp)");
+        kprintln!("[kernel] Framebuffer: OK (1280x720 @ 32bpp)");
     } else {
         kprintln!("[kernel] Framebuffer: FAILED -- UART-only mode");
     }
@@ -439,6 +439,7 @@ fn execute(line: &str) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let _ = writeln!(uart::UartWriter, "\n[KERNEL PANIC] {}", info);
+    let _ = writeln!(framebuffer::FbWriter, "\n[KERNEL PANIC] {}", info);
     loop {
         gpio::blink(3, 100, 100);
         gpio::blink(3, 300, 100);

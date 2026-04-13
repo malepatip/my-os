@@ -25,6 +25,9 @@ const FG: u32 = 0xFFFF_FFFF; // white
 
 const FONT_W: u32 = 8;
 const FONT_H: u32 = 8;
+const SCALE:  u32 = 2;            // each font pixel → 2×2 screen pixels
+const CHAR_W: u32 = FONT_W * SCALE; // 16 screen pixels wide per char
+const CHAR_H: u32 = FONT_H * SCALE; // 16 screen pixels tall per char
 
 // Full 8x8 bitmap font, ASCII 0x20-0x7F
 #[rustfmt::skip]
@@ -212,8 +215,8 @@ unsafe fn init_inner() -> bool {
         width:  actual_w,
         height: actual_h,
         pitch,
-        cols: actual_w / FONT_W,
-        rows: actual_h / FONT_H,
+        cols: actual_w / CHAR_W,
+        rows: actual_h / CHAR_H,
         col: 0,
         row: 0,
     });
@@ -235,20 +238,28 @@ pub fn clear_screen() {
     }
 }
 
-fn draw_char(c: u8, px: u32, py: u32) {
+/// Draw a character at character-grid position (char_col, char_row).
+/// Each font pixel is rendered as a SCALE×SCALE block of screen pixels.
+fn draw_char(c: u8, char_col: u32, char_row: u32) {
     unsafe {
         let fb = match FB { Some(ref mut f) => f, None => return };
         let idx = if c >= 0x20 && c <= 0x7F { (c - 0x20) as usize } else { 0 };
         let glyph = &FONT[idx];
         let pitch_words = fb.pitch / 4;
+        let origin_x = char_col * CHAR_W;
+        let origin_y = char_row * CHAR_H;
         for row in 0..FONT_H {
             let byte = glyph[row as usize];
             for col in 0..FONT_W {
                 let pixel = if byte & (0x80 >> col) != 0 { FG } else { BG };
-                let x = px + col;
-                let y = py + row;
-                if x < fb.width && y < fb.height {
-                    fb.base.add((y * pitch_words + x) as usize).write_volatile(pixel);
+                for sy in 0..SCALE {
+                    for sx in 0..SCALE {
+                        let x = origin_x + col * SCALE + sx;
+                        let y = origin_y + row * SCALE + sy;
+                        if x < fb.width && y < fb.height {
+                            fb.base.add((y * pitch_words + x) as usize).write_volatile(pixel);
+                        }
+                    }
                 }
             }
         }
@@ -258,12 +269,14 @@ fn draw_char(c: u8, px: u32, py: u32) {
 fn scroll_up() {
     unsafe {
         let fb = match FB { Some(ref mut f) => f, None => return };
-        let scroll_bytes = (fb.height - FONT_H) * fb.pitch;
-        let src = (fb.base as *mut u8).add(FONT_H as usize * fb.pitch as usize);
+        if fb.height <= CHAR_H { return; }
+        let scroll_bytes = (fb.height - CHAR_H) * fb.pitch;
+        let src = (fb.base as *mut u8).add(CHAR_H as usize * fb.pitch as usize);
         let dst = fb.base as *mut u8;
         core::ptr::copy(src, dst, scroll_bytes as usize);
-        let last_row_offset = (fb.height - FONT_H) * (fb.pitch / 4);
-        let last_row_words  = FONT_H * (fb.pitch / 4);
+        // Clear the newly exposed bottom row
+        let last_row_offset = (fb.height - CHAR_H) * (fb.pitch / 4);
+        let last_row_words  = CHAR_H * (fb.pitch / 4);
         for i in 0..last_row_words {
             fb.base.add((last_row_offset + i) as usize).write_volatile(BG);
         }
@@ -279,11 +292,11 @@ fn write_byte(c: u8) {
             0x08 | 0x7F => {
                 if fb.col > 0 {
                     fb.col -= 1;
-                    draw_char(b' ', fb.col * FONT_W, fb.row * FONT_H);
+                    draw_char(b' ', fb.col, fb.row);
                 }
             }
             _ => {
-                draw_char(c, fb.col * FONT_W, fb.row * FONT_H);
+                draw_char(c, fb.col, fb.row);
                 fb.col += 1;
                 if fb.col >= fb.cols { fb.col = 0; fb.row += 1; }
             }
