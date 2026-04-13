@@ -207,7 +207,7 @@ fn load_file_to_addr(name83: &[u8; 11], dest_addr: usize) -> usize {
 fn launch_linux_on_core1(dtb_addr: usize) {
     // Trampoline lives at 1MB — well above our kernel (~57KB) and below Linux (0x80000+)
     const TRAMPOLINE_ADDR: usize = 0x0010_0000;
-    // armstub8.S spin_cpu1 is at physical 0xE0
+    // Our own spin_cpu1 symbol at physical 0xE0 (kernel_old=1, kernel at 0x0)
     const SPIN_CPU1: usize = 0xE0;
 
     // HCR_EL2: RW=1 (AArch64 EL1), plus VM/SWIO/PTW/FMO/IMO/AMO
