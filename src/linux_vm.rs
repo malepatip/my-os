@@ -273,17 +273,17 @@ pub unsafe fn launch_linux(dtb_addr: usize) -> ! {
     //   VM  (bit 0)  = 1 — enable stage-2 address translation
     //   SWIO(bit 1)  = 1 — software I/O coherency
     //   PTW (bit 2)  = 1 — protected table walk
-    //   FMO (bit 3)  = 1 — route FIQ to EL2
-    //   IMO (bit 4)  = 1 — route IRQ to EL2
-    //   AMO (bit 5)  = 1 — route SError to EL2
-    //   TGE (bit 27) = 0 — EL1 is a guest (not host)
-    let hcr: u64 = (1 << 31) // RW
-                 | (1 << 0)  // VM
-                 | (1 << 1)  // SWIO
-                 | (1 << 2)  // PTW
-                 | (1 << 3)  // FMO
-                 | (1 << 4)  // IMO
-                 | (1 << 5); // AMO
+    //
+    // NOTE: IMO/FMO/AMO (bits 3/4/5) are intentionally NOT set.
+    // Setting them routes Linux's IRQs/FIQs/SErrors to EL2, but our
+    // EL2 handler only does a bare ERET — causing an infinite IRQ storm
+    // where Linux never processes its own interrupts. With these bits
+    // clear, Linux handles all its own interrupts directly at EL1 via
+    // the GIC, which is correct for a transparent type-2 hypervisor.
+    let hcr: u64 = (1 << 31) // RW   — EL1 is AArch64
+                 | (1 << 0)  // VM   — stage-2 translation enabled
+                 | (1 << 1)  // SWIO — software I/O coherency
+                 | (1 << 2); // PTW  — protected table walk
 
     // SPSR_EL2 for Linux entry: EL1h (0b0101), DAIF masked
     // 0x3C5 = 0b0011_1100_0101
