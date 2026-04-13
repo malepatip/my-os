@@ -115,6 +115,70 @@ fn sleep_ms(ms: u32) {
     }
 }
 
+// ─── Pi 4 Step -1: Power on SD card via VideoCore mailbox ───────────────────
+// Mailbox tag 0x00028001 = SET_POWER_STATE
+// Device ID 0x0 = SD card
+// State 0x3 = power ON + wait for stable
+//
+// THIS IS THE MOST CRITICAL STEP. Without this, the EMMC2 peripheral
+// clock is not running and the reset bit (C1_SRST_HC) never clears.
+// Both Circle and rpi_boot_emmc.c call this before touching any EMMC2 register.
+// Source: Circle/addon/SDCard/emmc.cpp line 680
+//         jncronin/rpi-boot emmc.c line 1306 (bcm_2708_power_cycle)
+#[repr(C, align(16))]
+struct MboxPowerBuf {
+    size:      u32,  // 0x1C = 28 bytes total
+    code:      u32,  // 0 = request
+    tag:       u32,  // 0x00028001 = SET_POWER_STATE
+    buf_sz:    u32,  // 8 bytes value buffer
+    req_sz:    u32,  // 8 bytes request
+    device_id: u32,  // 0x0 = SD card
+    state:     u32,  // 0x3 = ON + wait
+    end:       u32,  // 0x0 = end tag
+}
+static mut MBOX_POWER_BUF: MboxPowerBuf = MboxPowerBuf {
+    size: 0x1C, code: 0, tag: 0x0002_8001,
+    buf_sz: 8, req_sz: 8, device_id: 0, state: 3, end: 0,
+};
+
+#[inline(never)]
+fn power_on_sd_card() {
+    let phys = unsafe { &MBOX_POWER_BUF as *const MboxPowerBuf as u64 };
+    unsafe {
+        core::ptr::write_volatile(&mut MBOX_POWER_BUF.code, 0);
+        core::ptr::write_volatile(&mut MBOX_POWER_BUF.state, 3);
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack, nomem)) };
+    const MBOX_BASE:   u64 = 0xFE00_B880;
+    const MBOX_STATUS: u64 = MBOX_BASE + 0x18;
+    const MBOX_WRITE:  u64 = MBOX_BASE + 0x20;
+    const MBOX_READ:   u64 = MBOX_BASE + 0x00;
+    const MBOX_CH:     u32 = 8;  // property channel
+    let rd = |a: u64| unsafe { core::ptr::read_volatile(a as *const u32) };
+    let wr = |a: u64, v: u32| unsafe { core::ptr::write_volatile(a as *mut u32, v) };
+    // Wait for mailbox not full
+    let mut timeout = 1_000_000u32;
+    while rd(MBOX_STATUS) & 0x8000_0000 != 0 {
+        timeout = timeout.wrapping_sub(1);
+        if timeout == 0 { return; }
+    }
+    wr(MBOX_WRITE, (phys as u32 & !0xF) | MBOX_CH);
+    unsafe { core::arch::asm!("dsb sy", options(nostack, nomem)) };
+    // Wait for response
+    timeout = 1_000_000;
+    loop {
+        while rd(MBOX_STATUS) & 0x4000_0000 != 0 {
+            timeout = timeout.wrapping_sub(1);
+            if timeout == 0 { return; }
+        }
+        let r = rd(MBOX_READ);
+        if (r & 0xF) == MBOX_CH { break; }
+    }
+    unsafe { core::arch::asm!("dsb sy", options(nostack, nomem)) };
+    // Read result state (bit 0 = on, bit 1 = no device)
+    let _ = unsafe { core::ptr::read_volatile(&MBOX_POWER_BUF.state) };
+}
+
 // ─── Pi 4: Disable 1.8V supply via VideoCore mailbox ─────────────────────────
 // Mailbox tag 0x00038041 = PROPTAG_SET_SET_GPIO_STATE
 // GPIO 132 = EXP_GPIO_BASE(128) + 4 — controls SD card 1.8V supply
@@ -336,6 +400,12 @@ fn send_cmd(cmd: u32, arg: u32) -> u32 {
 /// Initialize the EMMC2 controller and SD card.
 /// Returns true on success.
 pub fn sd_init() -> bool {
+    // ── Pi 4 Step -1: Power on SD card via VideoCore ──────────────────────────
+    // CRITICAL: Without this, EMMC2 clock is not running and reset never clears.
+    // Source: Circle emmc.cpp line 680, rpi_boot_emmc.c line 1306
+    power_on_sd_card();
+    sleep_ms(10);
+
     // ── Pi 4 Step 0: Disable 1.8V supply ─────────────────────────────────────
     // REQUIRED on Pi 4. Sets GPIO 132 = 0 via mailbox to ensure 3.3V operation.
     // Source: Circle/addon/SDCard/emmc.cpp lines 541-549
