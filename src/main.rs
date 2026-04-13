@@ -100,9 +100,13 @@ pub extern "C" fn kernel_main() -> ! {
     }
 
     // ── Step 4: Load Linux kernel, initramfs, and DTB from SD card ───────
+    // Print directory listing so we can see exact 8.3 names on the card
+    fat32::fat32_list_files_debug();
+
     kprintln!("[kernel] Linux VM:    loading...");
 
-    // Load vmlinuz-rpi to LINUX_LOAD_ADDR (0x0040_0000)
+    // Load vmlinuz.rpi to LINUX_LOAD_ADDR (0x0040_0000)
+    // FAT32 8.3 name: "VMLINUZ RPI" (name=VMLINUZ_, ext=RPI)
     let linux_loaded = load_file_to_addr(b"VMLINUZ RPI", linux_vm::LINUX_LOAD_ADDR);
     if linux_loaded > 0 {
         kprintln!("[kernel] Linux VM:    kernel OK ({} KB)", linux_loaded / 1024);
