@@ -162,7 +162,12 @@ const DESC_BLOCK:    u64 = 0 << 1; // block (not table)
 const DESC_TABLE:    u64 = 1 << 1; // table (not block)
 const DESC_AF:       u64 = 1 << 10; // access flag
 const DESC_SH_INNER: u64 = 3 << 8;  // inner shareable
-const DESC_AP_RW:    u64 = 1 << 6;  // AP[2:1] = 01 = EL1 R/W
+// Stage-2 S2AP (bits [7:6]) — NOT the same as stage-1 AP:
+//   S2AP = 0b00 → no access from EL1
+//   S2AP = 0b01 → read-only  from EL1
+//   S2AP = 0b11 → read/write from EL1  (CORRECT for Linux guest RAM)
+const DESC_AP_RW:   u64 = 3 << 6;  // S2AP = 0b11 = EL1 read/write
+const DESC_AP_RO:   u64 = 1 << 6;  // S2AP = 0b01 = EL1 read-only (framebuffer protection)
 // MemAttr index 0 = normal memory (MAIR_EL2 index 0)
 const DESC_MEMATTR_NORMAL: u64 = 0 << 2;
 // MemAttr index 1 = device nGnRnE (MAIR_EL2 index 1)
@@ -254,6 +259,49 @@ pub fn setup_stage2_tables() {
             "msr vttbr_el2, {vttbr}",
             "isb",
             vttbr = in(reg) vttbr,
+        );
+    }
+}
+
+/// Mark the 2 MB block(s) covering the EL2 framebuffer as read-only from EL1.
+///
+/// Linux can still read the pixels (useful for its own simplefb driver), but
+/// any CPU store from EL1 will stage-2 fault.  The EL2 handler skips those
+/// writes silently so our crash screen is never overwritten.
+///
+/// Must be called AFTER setup_stage2_tables() and hv_console::init().
+pub fn protect_framebuffer(fb_phys: usize, fb_size: usize) {
+    if fb_phys == 0 || fb_size == 0 { return; }
+
+    let pool      = PT_POOL_ADDR as *mut u64;
+    let block     = BLOCK_SIZE_2MB;
+    let start_blk = fb_phys / block;
+    // Round the end up to cover the last partial block
+    let end_blk   = (fb_phys + fb_size + block - 1) / block;
+
+    for blk in start_blk..end_blk {
+        let gb   = blk / 512;
+        let mb2  = blk % 512;
+        if gb >= 4 { break; }
+
+        // L2 table for this GB lives at pool + 512 (L1 skip) + gb*512 entries
+        let l2_table = unsafe { pool.add(512 + gb * 512) };
+        let entry_ptr = unsafe { l2_table.add(mb2) };
+
+        // Read existing descriptor, clear S2AP bits [7:6], set read-only
+        let desc = unsafe { entry_ptr.read_volatile() };
+        let desc = (desc & !(3 << 6)) | DESC_AP_RO;
+        unsafe { entry_ptr.write_volatile(desc); }
+    }
+
+    // Flush stage-2 TLB entries so the new permissions take effect
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",        // ensure descriptor writes are visible
+            "tlbi vmalls12e1",  // invalidate all stage-1/2 EL1 TLB entries
+            "dsb ish",
+            "isb",
+            options(nomem, nostack),
         );
     }
 }

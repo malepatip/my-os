@@ -143,17 +143,14 @@ global_asm!(
     ".balign 128", "b _el2_panic",
     ".balign 128", "b _el2_panic",
 
-    // _el2_panic: save ESR_EL2 to 0x201010, ELR_EL2 to 0x201018 for post-mortem
+    // _el2_panic: current-EL exception (EL2 bug) — display fault screen.
+    // No stack frame to unwind; SP_EL2 is valid (set at boot to 0x400000).
     "_el2_panic:",
     "mrs x0, esr_el2",
     "mrs x1, elr_el2",
-    "movz x2, #0x1010",
-    "movk x2, #0x0020, lsl #16",
-    "str x0, [x2]",
-    "str x1, [x2, #8]",
-    "dsb sy",
-    "wfe",
-    "b _el2_panic",
+    "mrs x2, far_el2",
+    "mrs x3, hpfar_el2",
+    "b hv_fault_screen",   // noreturn — halts inside Rust
 
     // _el2_lower_sync: handle HVC/SMC calls from Linux (PSCI, SMCCC)
     // and catch stage-2 faults. A bare eret causes Linux to panic because
@@ -169,17 +166,37 @@ global_asm!(
     "b.eq .L_hvc_handler",
     "cmp x4, #0x17",
     "b.eq .L_hvc_handler",
-    // Not HVC/SMC: stage-2 fault or other — save fault info and panic
+    // Not HVC/SMC — check if it is a permission fault (EC=0x24, DFSC=0x0F)
+    // caused by Linux writing to our read-only framebuffer region.
+    // If so, skip the faulting instruction and return to Linux silently.
+    // This keeps our crash-screen pixels intact even while Linux boots.
+    "mrs x0, esr_el2",
+    "lsr x1, x0, #26",          // x1 = EC
+    "and x1, x1, #0x3F",
+    "cmp x1, #0x24",             // EC == Data abort lower EL?
+    "b.ne .L_real_fault",
+    "and x1, x0, #0x3F",        // x1 = DFSC
+    "cmp x1, #0x0F",             // DFSC == Permission fault L3?
+    "b.ne .L_real_fault",
+    "tst x0, #(1 << 6)",         // WnR bit — was it a write?
+    "b.eq .L_real_fault",        // reads are unexpected; show crash
+    // It is a write-permission fault → skip instruction, return to Linux
+    "mrs x1, elr_el2",
+    "add x1, x1, #4",
+    "msr elr_el2, x1",
+    "ldp x0, x1, [sp, #0]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x4, x30, [sp, #32]",
+    "add sp, sp, #48",
+    "eret",
+    // Real fault — restore stack, display crash screen, halt
+    ".L_real_fault:",
+    "add sp, sp, #48",
     "mrs x0, esr_el2",
     "mrs x1, elr_el2",
     "mrs x2, far_el2",
-    "movz x3, #0x1020",
-    "movk x3, #0x0020, lsl #16",
-    "str x0, [x3]",
-    "str x1, [x3, #8]",
-    "str x2, [x3, #16]",
-    "dsb sy",
-    "b _el2_panic",
+    "mrs x3, hpfar_el2",
+    "b hv_fault_screen",
     // HVC/SMC handler: dispatch on function ID in x0
     ".L_hvc_handler:",
     "ldr x0, [sp, #0]",

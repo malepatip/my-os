@@ -25,9 +25,11 @@
 #![no_main]
 
 mod boot;
+mod font;
 mod uart;
 mod mailbox;
 mod framebuffer;
+mod hv_console;
 mod gpio;
 mod emmc;
 mod fat32;
@@ -69,7 +71,13 @@ pub extern "C" fn kernel_main() -> ! {
     // A 500ms delay here ensures the GPU has finished its own boot sequence.
     gpio::delay_ms(500);
     let fb_ok = framebuffer::init();
-    if fb_ok { gpio::blink(5, 100, 100); }
+    if fb_ok {
+        // Register framebuffer with EL2 fault console.  Must happen before
+        // ERET to Linux so the assembly exception handler can find the buffer.
+        let (fb_base, fb_pitch, fb_w, fb_h) = framebuffer::get_info();
+        hv_console::init(fb_base, fb_pitch, fb_w, fb_h);
+        gpio::blink(5, 100, 100);
+    }
 
     // ── Step 2: Boot banner ───────────────────────────────────────────────
     kprintln!("========================================");
@@ -157,6 +165,16 @@ pub extern "C" fn kernel_main() -> ! {
     kprint!("[kernel] Stage-2 MMU: ");
     linux_vm::setup_stage2_tables();
     kprintln!("OK (4GB identity map)");
+
+    // Mark the EL2 framebuffer read-only from EL1 so Linux cannot overwrite
+    // our crash-screen pixels.  EL1 write faults to this region are silently
+    // skipped in the exception handler (boot.rs).
+    let fb_phys = hv_console::base_addr();
+    if fb_phys != 0 {
+        let (_, fb_pitch, _, fb_h) = framebuffer::get_info();
+        linux_vm::protect_framebuffer(fb_phys, (fb_pitch * fb_h) as usize);
+        kprintln!("[kernel] HV console: framebuffer protected @ 0x{:08X}", fb_phys);
+    }
 
     // ── Step 6: ERET Core 0 into Linux at EL1 ───────────────────────────────
     // With TF-A, Core 0 is at EL2. We ERET directly into Linux at EL1.
