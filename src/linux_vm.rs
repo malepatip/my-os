@@ -129,17 +129,21 @@ impl SharedMem {
 
 // ── Stage-2 page table setup ─────────────────────────────────────────────────
 //
-// We use a 3-level page table (L1 → L2 → L2 block entries) for a 4GB
+// We use a 3-level page table (L1 → L2 block entries) for a 36-bit IPA
 // identity map. Each L2 block entry covers 2MB.
 //
 // VTCR_EL2 configuration:
-//   T0SZ=32  (input address size = 4GB, 32-bit IPA)
-//   SL0=1    (start at L1)
+//   T0SZ=28  (input address size = 64GB, 36-bit IPA)
+//   SL0=1    (start at L1 — with 4KB granule + T0SZ=28, L1 has 64 entries)
 //   IRGN0=1  (inner write-back, write-allocate)
 //   ORGN0=1  (outer write-back, write-allocate)
 //   SH0=3    (inner shareable)
 //   TG0=0    (4KB granule)
-//   PS=0     (32-bit physical address space)
+//   PS=1     (36-bit physical address space)
+//
+// Why 36-bit? The Pi 4 PCIe MMIO window lives at 0x600000000 (>32-bit).
+// Linux's xHCI/USB driver accesses this region — without a 36-bit mapping
+// it faults with Translation fault L0 (DFSC=0x04) at IPA=0x600000000.
 //
 // Stage-2 block descriptor (2MB):
 //   [0]     = 1 (valid)
@@ -153,7 +157,7 @@ impl SharedMem {
 
 const PAGE_SIZE: usize = 4096;
 const BLOCK_SIZE_2MB: usize = 2 * 1024 * 1024;
-const L1_ENTRIES: usize = 4;       // 4 L1 entries = 4 x 1GB = 4GB
+const L1_ENTRIES: usize = 64;      // 64 L1 entries = 64 x 1GB = 64GB (36-bit IPA)
 const L2_ENTRIES: usize = 512;     // 512 L2 entries per L1 = 512 x 2MB = 1GB
 
 // Stage-2 descriptor bits
@@ -173,39 +177,46 @@ const DESC_MEMATTR_NORMAL: u64 = 0 << 2;
 // MemAttr index 1 = device nGnRnE (MAIR_EL2 index 1)
 const DESC_MEMATTR_DEVICE: u64 = 1 << 2;
 
-/// Set up stage-2 identity page tables for 4GB.
+/// Set up stage-2 identity page tables for 36-bit IPA space (64GB).
 /// Called once from kernel_main before launching Linux.
 pub fn setup_stage2_tables() {
-    // Page table pool: L1 table (4 entries) + 4 x L2 tables (512 entries each)
-    // Total: 4*8 + 4*512*8 = 32 + 16384 = 16416 bytes
+    // Pool layout (64KB total):
+    //   Offset 0x0000: L1 table — 64 entries × 8 bytes = 512 bytes (< 1 page)
+    //   Offset 0x1000: L2 for GB0  (0x000000000 – 0x03FFFFFFF)
+    //   Offset 0x2000: L2 for GB1  (0x040000000 – 0x07FFFFFFF)
+    //   Offset 0x3000: L2 for GB2  (0x080000000 – 0x0BFFFFFFF)
+    //   Offset 0x4000: L2 for GB3  (0x0C0000000 – 0x0FFFFFFFF)  ← Pi 4 peripherals
+    //   Offset 0x5000: L2 for GB6  (0x180000000 – 0x1BFFFFFFF)  ← Pi 4 PCIe MMIO
+    //   Total used: 6 pages = 24KB (well within 64KB pool)
+    //
+    // With T0SZ=28 and 4KB granule, L1 has 64 entries covering 64×1GB = 64GB.
+    // L1 entry index = IPA[35:30], L2 entry index = IPA[29:21].
     let pool = PT_POOL_ADDR as *mut u64;
 
-    // Zero the pool
+    // Zero the entire pool
     unsafe {
         core::ptr::write_bytes(pool, 0, PT_POOL_SIZE / 8);
     }
 
-    // L1 table is at PT_POOL_ADDR
+    // L1 table is at PT_POOL_ADDR (pool[0..64])
     let l1_table = pool;
 
-    // L2 tables start at PT_POOL_ADDR + PAGE_SIZE
-    for gb in 0..4usize {
-        let l2_table = unsafe { pool.add(512 + gb * 512) }; // 512 u64s per table
-        // L2 table for this GB lives at PT_POOL_ADDR + PAGE_SIZE + gb*PAGE_SIZE.
-        // The pointer pool.add(512 + gb*512) maps to byte offset (512+gb*512)*8
-        // = 0x1000 + gb*0x1000 from pool start — must match l2_phys exactly.
-        let l2_phys = PT_POOL_ADDR + PAGE_SIZE + gb * PAGE_SIZE;
+    // Helper: map one GB region with an L2 table at pool slot `slot`
+    // slot 0 → pool offset 0x1000 (pool[512..1024])
+    // slot 1 → pool offset 0x2000 (pool[1024..1536])
+    // etc.
+    let map_gb = |gb_index: usize, slot: usize, is_device_region: bool| {
+        let l2_table = unsafe { pool.add(512 + slot * 512) };
+        let l2_phys  = PT_POOL_ADDR + PAGE_SIZE + slot * PAGE_SIZE;
+        let l1_desc  = (l2_phys as u64) | DESC_TABLE | DESC_VALID;
+        unsafe { l1_table.add(gb_index).write_volatile(l1_desc); }
 
-        // L1 entry points to L2 table
-        let l1_desc = (l2_phys as u64) | DESC_TABLE | DESC_VALID;
-        unsafe { l1_table.add(gb).write_volatile(l1_desc); }
-
-        // Fill L2 table with 2MB block entries
         for mb2 in 0..512usize {
-            let phys_addr = (gb * 1024 * 1024 * 1024 + mb2 * BLOCK_SIZE_2MB) as u64;
+            let phys_addr = (gb_index as u64) * 0x4000_0000
+                          + (mb2 as u64) * (BLOCK_SIZE_2MB as u64);
 
-            // Device memory for peripheral regions (above 0xFC000000)
-            let memattr = if phys_addr >= 0xFC00_0000 {
+            // Device memory for: peripheral GB3 (0xC0000000+) and PCIe GB6
+            let memattr = if is_device_region || phys_addr >= 0xFC00_0000 {
                 DESC_MEMATTR_DEVICE
             } else {
                 DESC_MEMATTR_NORMAL
@@ -218,10 +229,20 @@ pub fn setup_stage2_tables() {
                 | DESC_SH_INNER
                 | DESC_AP_RW
                 | memattr;
-
             unsafe { l2_table.add(mb2).write_volatile(desc); }
         }
-    }
+    };
+
+    // Map the four 1GB RAM regions (GB0–GB3)
+    map_gb(0, 0, false); // 0x000000000 – 0x03FFFFFFF  normal RAM
+    map_gb(1, 1, false); // 0x040000000 – 0x07FFFFFFF  normal RAM
+    map_gb(2, 2, false); // 0x080000000 – 0x0BFFFFFFF  normal RAM
+    map_gb(3, 3, false); // 0x0C0000000 – 0x0FFFFFFFF  BCM2711 peripherals
+
+    // Map Pi 4 PCIe MMIO window at 0x600000000 (GB24 in 36-bit space)
+    // 0x600000000 >> 30 = 24, so this is L1 entry 24.
+    // Linux xHCI/USB driver accesses this region for the VL805 USB controller.
+    map_gb(24, 4, true); // 0x600000000 – 0x63FFFFFFF  PCIe MMIO (device)
 
     // Set up MAIR_EL2:
     //   Index 0: normal memory (0xFF = write-back, write-allocate, inner+outer)
@@ -236,15 +257,15 @@ pub fn setup_stage2_tables() {
     }
 
     // Set up VTCR_EL2
-    // T0SZ=32 (4GB IPA), SL0=1 (L1 start), TG0=0 (4KB), PS=0 (32-bit PA)
+    // T0SZ=28 (64GB IPA = 36-bit), SL0=1 (L1 start), TG0=0 (4KB), PS=1 (36-bit PA)
     // IRGN0=1, ORGN0=1, SH0=3
-    let vtcr: u64 = (32 << 0)  // T0SZ
+    let vtcr: u64 = (28 << 0)  // T0SZ = 28 → IPA size = 2^(64-28) = 2^36 = 64GB
                   | (1  << 6)  // SL0 = 1 (start at L1)
                   | (1  << 8)  // IRGN0 = write-back
                   | (1  << 10) // ORGN0 = write-back
                   | (3  << 12) // SH0 = inner shareable
                   | (0  << 14) // TG0 = 4KB
-                  | (0  << 16) // PS = 32-bit
+                  | (1  << 16) // PS = 1 → 36-bit physical address output
                   | (1  << 31); // RES1
 
     unsafe {
