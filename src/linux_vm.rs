@@ -191,7 +191,10 @@ pub fn setup_stage2_tables() {
     // L2 tables start at PT_POOL_ADDR + PAGE_SIZE
     for gb in 0..4usize {
         let l2_table = unsafe { pool.add(512 + gb * 512) }; // 512 u64s per table
-        let l2_phys = PT_POOL_ADDR + PAGE_SIZE + gb * PAGE_SIZE * 2;
+        // L2 table for this GB lives at PT_POOL_ADDR + PAGE_SIZE + gb*PAGE_SIZE.
+        // The pointer pool.add(512 + gb*512) maps to byte offset (512+gb*512)*8
+        // = 0x1000 + gb*0x1000 from pool start — must match l2_phys exactly.
+        let l2_phys = PT_POOL_ADDR + PAGE_SIZE + gb * PAGE_SIZE;
 
         // L1 entry points to L2 table
         let l1_desc = (l2_phys as u64) | DESC_TABLE | DESC_VALID;
